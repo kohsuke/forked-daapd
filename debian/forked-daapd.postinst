@@ -1,0 +1,13 @@
+#!/bin/sh
+
+set -e
+
+if ! getent passwd daapd > /dev/null 2>&1; then
+    adduser --quiet --system --no-create-home --home /var/cache/forked-daapd daapd
+fi
+
+if ! dpkg-statoverride --list /var/cache/forked-daapd > /dev/null 2>&1; then
+    dpkg-statoverride --update --add daapd root 0755 /var/cache/forked-daapd
+fi
+
+#DEBHELPER#

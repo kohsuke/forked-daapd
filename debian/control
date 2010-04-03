@@ -1,0 +1,22 @@
+Source: forked-daapd
+Section: sound
+Priority: optional
+Maintainer: Julien BLACHE <jblache@debian.org>
+Build-Depends: debhelper (>= 7), libflac-dev, libtagc0-dev, libavcodec-dev (>= 3:0.svn20090204), libavformat-dev (>= 3:0.svn20090204), libavahi-client-dev, libevent-dev, libsqlite3-dev, libconfuse-dev, libavl-dev, libmxml-dev, libplist-dev (>= 0.16), libgcrypt11-dev, libantlr3c-dev, antlr3, autotools-dev, libswscale-dev, libicu-dev
+Standards-Version: 3.8.3
+
+Package: forked-daapd
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, avahi-daemon, adduser
+Description: RSP server and iTunes-compatible DAAP server
+ forked-daapd is a Linux-optimized RSP (Roku Streaming Protocol) and
+ DAAP (Digital Audio Access Protocol) server written as a rewrite
+ of/replacement for mt-daapd (Firefly Media Server).
+ .
+ It allows you to share your music collection over the local network using
+ the DAAP protocol also used by Apple's iTunes and/or the RSP protocol used
+ by devices from Roku.
+ .
+ Built-in, on the fly decoding support enables serving popular free music
+ formats like FLAC, Ogg Vorbis or Musepack to those clients that do not
+ otherwise support these formats.

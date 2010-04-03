@@ -1,0 +1,6 @@
+#!/bin/bash
+
+DIR=`cd $(dirname $0); pwd`
+
+export CLASSPATH=/usr/share/java/stringtemplate.jar:$DIR/antlr-3.1.3.jar
+exec java org.antlr.Tool "$@"
