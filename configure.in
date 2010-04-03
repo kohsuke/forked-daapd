@@ -28,7 +28,7 @@ if test "x$ANTLR" = x; then
 fi
 AC_SUBST(ANTLR)
 
-CFLAGS="$CFLAGS -Wall -D_LARGEFILE_SOURCE"
+CFLAGS="$CFLAGS -Wall -D_LARGEFILE_SOURCE -licui18n -licuuc -licudata"
 
 AC_CHECK_HEADERS([sys/wait.h])
 AC_CHECK_HEADERS([sys/param.h])

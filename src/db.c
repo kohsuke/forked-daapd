@@ -27,15 +27,19 @@
 #include <stdint.h>
 #include <inttypes.h>
 
+#include <assert.h>
+
 #include <pthread.h>
 
 #include <sqlite3.h>
+
+#include <unicode/utypes.h>
+#include <unicode/ucnv.h>
 
 #include "conffile.h"
 #include "logger.h"
 #include "misc.h"
 #include "db.h"
-
 
 #define STR(x) ((x) ? (x) : "")
 
@@ -246,6 +250,8 @@ db_smartpl_count_items(const char *smartpl_query);
 struct playlist_info *
 db_pl_fetch_byid(int id);
 
+void ensure_all_utf8(struct media_file_info *mfi);
+void ensure_utf8(char *str);
 
 char *
 db_escape_string(const char *str)
@@ -1723,6 +1729,8 @@ db_file_add(struct media_file_info *mfi)
   if (mfi->time_modified == 0)
     mfi->time_modified = mfi->db_timestamp;
 
+  ensure_all_utf8(mfi);
+
   query = sqlite3_mprintf(Q_TMPL,
 			  STR(mfi->path), STR(mfi->fname), mfi->title, mfi->artist, mfi->album,
 			  mfi->genre, mfi->comment, mfi->type, mfi->composer,
@@ -1793,6 +1801,8 @@ db_file_update(struct media_file_info *mfi)
 
   if (mfi->time_modified == 0)
     mfi->time_modified = mfi->db_timestamp;
+
+  ensure_all_utf8(mfi);
 
   query = sqlite3_mprintf(Q_TMPL,
 			  STR(mfi->path), STR(mfi->fname), mfi->title, mfi->artist, mfi->album, mfi->genre,
@@ -3963,4 +3973,73 @@ db_init(void)
   DPRINTF(E_INFO, L_DB, "Database OK with %d active files and %d active playlists\n", files, pls);
 
   return 0;
+}
+
+void ensure_all_utf8(struct media_file_info *mfi)
+{
+  ensure_utf8(mfi->title);
+  ensure_utf8(mfi->artist);
+  ensure_utf8(mfi->album);
+  ensure_utf8(mfi->genre);
+  ensure_utf8(mfi->comment);
+  ensure_utf8(mfi->type);
+  ensure_utf8(mfi->composer);
+  ensure_utf8(mfi->orchestra);
+  ensure_utf8(mfi->conductor);
+  ensure_utf8(mfi->url);
+  ensure_utf8(mfi->description);
+  ensure_utf8(mfi->codectype);
+  ensure_utf8(mfi->codectype);
+}
+
+void ensure_utf8(char *str)
+{
+  if (str == NULL)
+    return;
+
+  UErrorCode status = U_ZERO_ERROR;
+
+  /* First convert to unicode */
+
+  UConverter *conv = ucnv_open(NULL, &status);
+  assert(U_SUCCESS(status));
+
+  uint32_t ucharsLen = ucnv_toUChars(conv, NULL, 0, str, strlen(str), &status);
+  if (status != U_BUFFER_OVERFLOW_ERROR) {
+    DPRINTF(E_LOG, L_SCAN, "Error: Preflight ucnv_toUChars ICU failed: %s (%d)\n", u_errorName(status), status);
+    return;
+  };
+
+  status = U_ZERO_ERROR;
+
+  UChar *ucharBuf = 0;
+  ucharBuf = (UChar *)realloc(ucharBuf, (ucharsLen+1) * sizeof(UChar));
+
+  ucnv_toUChars(conv, ucharBuf, ucharsLen + 1, str, strlen(str), &status);
+  if (!U_SUCCESS(status)) {
+    DPRINTF(E_LOG, L_SCAN, "Error: ucnv_toUChars (2) failed: %s (%d)\n", u_errorName(status), status);
+    assert(U_SUCCESS(status));
+  }
+
+  ucnv_close(conv);
+
+  /* Then to UTF-8 */
+
+  char bytes[2000];
+
+  status = U_ZERO_ERROR;
+
+  conv = ucnv_open("utf-8", &status);
+  assert(U_SUCCESS(status));
+
+  status = U_ZERO_ERROR;
+
+  ucnv_fromUChars(conv, bytes, sizeof(bytes), ucharBuf, ucharsLen, &status);
+  assert(U_SUCCESS(status));
+
+  ucnv_close(conv);
+
+  free(ucharBuf);
+
+  strcpy(str, bytes);
 }
