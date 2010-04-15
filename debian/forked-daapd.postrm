@@ -1,0 +1,12 @@
+#!/bin/sh
+
+set -e
+
+if [ "$1" = purge ]; then
+    dpkg-statoverride --remove /var/cache/forked-daapd
+
+    rm -f /var/cache/forked-daapd/songs3.db
+    rmdir --ignore-fail-on-non-empty /var/cache/forked-daapd
+fi
+
+#DEBHELPER#

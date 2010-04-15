@@ -1,0 +1,13 @@
+/var/log/forked-daapd.log {
+	weekly
+	missingok
+	notifempty
+	rotate 3
+	compress
+	delaycompress
+	noolddir
+	postrotate
+		killall -HUP forked-daapd
+	endscript
+}
+
