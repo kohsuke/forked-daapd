@@ -1929,8 +1929,10 @@ raop_v2_timing_cb(int fd, short what, void *arg)
 
 	for (rs = sessions; rs; rs = rs->next)
 	  {
-	    if ((rs->sa.ss.ss_family == AF_INET)
-		&& (sa.sin.sin_addr.s_addr == rs->sa.sin.sin_addr.s_addr))
+	    if ((rs->sa.ss.ss_family == AF_INET))
+// KK - the price I pay for accepting 169.254.* in browse_resolve_callback is that
+// the IP address will be different
+//		&& (sa.sin.sin_addr.s_addr == rs->sa.sin.sin_addr.s_addr))
 	      break;
 	  }
 
@@ -2291,8 +2293,9 @@ raop_v2_control_cb(int fd, short what, void *arg)
 
 	for (rs = sessions; rs; rs = rs->next)
 	  {
-	    if ((rs->sa.ss.ss_family == AF_INET)
-		&& (sa.sin.sin_addr.s_addr == rs->sa.sin.sin_addr.s_addr))
+	    if ((rs->sa.ss.ss_family == AF_INET))
+		// KK - ditto
+		// && (sa.sin.sin_addr.s_addr == rs->sa.sin.sin_addr.s_addr))
 	      break;
 	  }
 

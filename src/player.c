@@ -2131,12 +2131,13 @@ playback_start(struct player_command *cmd)
     }
 
   /* Start local audio if needed */
+  // laudio_selected = 0; // to disable local audio
   if (laudio_selected && (laudio_status == LAUDIO_CLOSED))
     {
       ret = laudio_open();
       if (ret < 0)
 	{
-	  DPRINTF(E_LOG, L_PLAYER, "Could not open local audio\n");
+	  DPRINTF(E_LOG, L_PLAYER, "Could not open local audio!\n");
 
 	  playback_abort();
 	  return -1;
@@ -2388,6 +2389,7 @@ speaker_enumerate(struct player_command *cmd)
   /* Auto-select local audio if there are no AirTunes devices */
   if (!dev_list && !laudio_selected)
     speaker_select_laudio();
+  // DPRINTF(E_LOG, L_PLAYER, "skipping laudio selection\n");
 
   spk_enum->cb(0, laudio_name, laudio_relvol, laudio_selected, 0, spk_enum->arg);
 
@@ -2396,8 +2398,11 @@ speaker_enumerate(struct player_command *cmd)
   DPRINTF(E_DBG, L_PLAYER, "*** laudio: abs %d rel %d\n", laudio_volume, laudio_relvol);
 #endif
 
+  DPRINTF(E_DBG, L_PLAYER, "Listing ra player %X\n", dev_list);
   for (rd = dev_list; rd; rd = rd->next)
     {
+  DPRINTF(E_DBG, L_PLAYER, "Listing ra player %s\n", rd->name);
+
       if (rd->advertised || rd->selected)
 	{
 	  spk_enum->cb(rd->id, rd->name, rd->relvol, rd->selected, rd->has_password, spk_enum->arg);
@@ -3631,7 +3636,7 @@ raop_device_cb(const char *name, const char *type, const char *domain, const cha
     devtype = RAOP_DEV_APPLETV;
 
  no_am:
-  DPRINTF(E_DBG, L_PLAYER, "AirTunes device %s: password: %s, type %s\n", name, (password) ? "yes" : "no", raop_devtype[devtype]);
+  DPRINTF(E_LOG, L_PLAYER, "AirTunes device %s: password: %s, type %s\n", name, (password) ? "yes" : "no", raop_devtype[devtype]);
 
   rd->advertised = 1;
 
@@ -3654,7 +3659,8 @@ raop_device_cb(const char *name, const char *type, const char *domain, const cha
   rd->password = password;
 
   player_device_add(rd);
-
+  speaker_select_raop(rd); // KK - enable it as soon as selected
+  
   return;
 
  free_rd:
@@ -3834,6 +3840,7 @@ player_init(void)
       goto raop_fail;
     }
 
+  DPRINTF(E_LOG, L_PLAYER, "Discovering AirTunes devices\n");
   ret = mdns_browse("_raop._tcp", raop_device_cb);
   if (ret < 0)
     {

@@ -4,7 +4,7 @@
  * Copyright (C) 2009-2010 Julien BLACHE <jb@jblache.org>
  *
  * Pieces coming from mt-daapd:
- * Copyright (C) 2005 Sebastian Dröge <slomo@ubuntu.com>
+ * Copyright (C) 2005 Sebastian Drï¿½ge <slomo@ubuntu.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -388,11 +388,15 @@ browse_resolve_callback(AvahiServiceResolver *r, AvahiIfIndex intf, AvahiProtoco
       case AVAHI_RESOLVER_FOUND:
 	DPRINTF(E_DBG, L_MDNS, "Avahi Resolver: resolved service '%s' type '%s' proto %d\n", name, type, proto);
 
-	ll = is_link_local(addr);
+	// KK - if I reject 192.168.* my AirTunes get rejected.
+	// How does avahi passes multiple IP addresses?
+	// ll = is_link_local(addr);
+	ll = 0;
 
 	switch (proto)
 	  {
 	    case AVAHI_PROTO_INET:
+		    avahi_record_browser_new()
 	      if (ll)
 		{
 		  family = AF_UNSPEC;
