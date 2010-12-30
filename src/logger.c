@@ -21,6 +21,7 @@
 #endif
 
 #include <stdio.h>
+#include <unistd.h>
 #include <stdarg.h>
 #include <string.h>
 #include <time.h>
@@ -40,7 +41,7 @@ static int threshold;
 static int console;
 static char *logfilename;
 static FILE *logfile;
-static char *labels[] = { "config", "daap", "db", "httpd", "main", "mdns", "misc", "rsp", "scan", "xcode", "event", "remote", "dacp", "ffmpeg", "artwork" };
+static char *labels[] = { "config", "daap", "db", "httpd", "main", "mdns", "misc", "rsp", "scan", "xcode", "event", "remote", "dacp", "ffmpeg", "artwork", "player", "raop", "laudio" };
 
 
 static int
@@ -75,7 +76,7 @@ set_logdomains(char *domains)
   return 0;
 }
 
-void
+static void
 vlogger(int severity, int domain, const char *fmt, va_list args)
 {
   va_list ap;
@@ -181,25 +182,59 @@ logger_libevent(int severity, const char *msg)
   DPRINTF(severity, L_EVENT, "%s\n", msg);
 }
 
+#ifdef LAUDIO_USE_ALSA
+void
+logger_alsa(const char *file, int line, const char *function, int err, const char *fmt, ...)
+{
+  va_list ap;
+
+  va_start(ap, fmt);
+  vlogger(E_LOG, L_LAUDIO, fmt, ap);
+  va_end(ap);
+}
+#endif /* LAUDIO_USE_ALSA */
+
 void
 logger_reinit(void)
 {
   FILE *fp;
+  uid_t uid;
+  int ret;
+
+  if (!logfile)
+    return;
 
   pthread_mutex_lock(&logger_lck);
 
-  if (logfile)
-    {
-      fp = fopen(logfilename, "a");
-      if (!fp)
-	{
-	  fprintf(logfile, "WARNING: Could not reopen logfile, logging will stop now\n");
-	}
+  uid = geteuid();
 
-      fclose(logfile);
-      logfile = fp;
+  if (uid != 0)
+    {
+      ret = seteuid(0);
+      if (ret < 0)
+	fprintf(logfile, "logger_reinit: seteuid(0) failed: %s\n", strerror(errno));
     }
 
+  fp = fopen(logfilename, "a");
+
+  if (uid != 0)
+    {
+      ret = seteuid(uid);
+      if (ret < 0)
+	fprintf(logfile, "logger_reinit: seteuid(%lu) failed: %s\n", (unsigned long)uid, strerror(errno));
+    }
+
+  if (!fp)
+    {
+      fprintf(logfile, "Could not reopen logfile: %s\n", strerror(errno));
+
+      goto out;
+    }
+
+  fclose(logfile);
+  logfile = fp;
+
+ out:
   pthread_mutex_unlock(&logger_lck);
 }
 

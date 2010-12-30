@@ -13,6 +13,14 @@ if COND_ITUNES
 ITUNESSRC=filescanner_itunes.c
 endif
 
+if COND_ALSA
+ALSASRC=laudio_alsa.c
+endif
+
+if COND_OSS4
+OSS4SRC=laudio_oss4.c
+endif
+
 ANTLR_GRAMMARS = \
 	RSP.g RSP2SQL.g \
 	DAAP.g DAAP2SQL.g
@@ -25,17 +33,17 @@ ANTLR_SOURCES = \
 
 ANTLR_PRODUCTS =
 
-forked_daapd_CPPFLAGS = -D_GNU_SOURCE @AVAHI_CFLAGS@ @SQLITE3_CFLAGS@ @FFMPEG_CFLAGS@ @CONFUSE_CFLAGS@ @TAGLIB_CFLAGS@ @MINIXML_CFLAGS@ @LIBPLIST_CFLAGS@ @LIBGCRYPT_CFLAGS@ \
-	-DDATADIR="\"$(pkgdatadir)\"" -DCONFDIR="\"$(sysconfdir)\"" -DSTATEDIR="\"$(localstatedir)\""
+forked_daapd_CPPFLAGS = -D_GNU_SOURCE @ZLIB_CFLAGS@ @AVAHI_CFLAGS@ @SQLITE3_CFLAGS@ @FFMPEG_CFLAGS@ @CONFUSE_CFLAGS@ @TAGLIB_CFLAGS@ @MINIXML_CFLAGS@ @LIBPLIST_CFLAGS@ @LIBGCRYPT_CFLAGS@ @ALSA_CFLAGS@ @OSS4CPPFLAGS@ \
+	-DDATADIR="\"$(pkgdatadir)\"" -DCONFDIR="\"$(sysconfdir)\"" -DSTATEDIR="\"$(localstatedir)\"" -DPKGLIBDIR="\"$(pkglibdir)\""
 
-forked_daapd_LDADD = @AVAHI_LIBS@ @SQLITE3_LIBS@ @FFMPEG_LIBS@ @CONFUSE_LIBS@ @FLAC_LIBS@ @TAGLIB_LIBS@ @LIBEVENT_LIBS@ @LIBAVL_LIBS@ @MINIXML_LIBS@ @ANTLR3C_LIBS@ @LIBPLIST_LIBS@ @LIBGCRYPT_LIBS@
+forked_daapd_LDADD = @ZLIB_LIBS@ @AVAHI_LIBS@ @SQLITE3_LIBS@ @FFMPEG_LIBS@ @CONFUSE_LIBS@ @FLAC_LIBS@ @TAGLIB_LIBS@ @LIBEVENT_LIBS@ @LIBAVL_LIBS@ @MINIXML_LIBS@ @ANTLR3C_LIBS@ @LIBPLIST_LIBS@ @LIBGCRYPT_LIBS@ @ALSA_LIBS@ @LIBUNISTRING@
 forked_daapd_SOURCES = main.c \
 	db.c db.h \
 	logger.c logger.h \
 	conffile.c conffile.h \
 	filescanner.c filescanner.h \
 	filescanner_ffmpeg.c filescanner_urlfile.c filescanner_m3u.c $(ITUNESSRC) \
-	mdns_avahi.c mdns_avahi.h \
+	mdns_avahi.c mdns.h \
 	remote_pairing.c remote_pairing.h \
 	evhttp/http.c evhttp/evhttp.h \
 	evhttp/http-internal.h evhttp/log.h \
@@ -48,8 +56,14 @@ forked_daapd_SOURCES = main.c \
 	transcode.c transcode.h \
 	artwork.c artwork.h \
 	misc.c misc.h \
+	rng.c rng.h \
 	rsp_query.c rsp_query.h \
 	daap_query.c daap_query.h \
+	player.c player.h \
+	$(ALSASRC) $(OSS4SRC) laudio.h \
+	raop.c raop.h \
+	evrtsp/rtsp.c evrtp/evrtsp.h \
+	evrtsp/rtsp-internal.h evrtsp/log.h \
 	scan-wma.c \
 	$(FLACSRC) $(MUSEPACKSRC)
 
@@ -65,21 +79,28 @@ EXTRA_DIST = \
 rsp_query.c: RSPLexer.h RSPParser.h RSP2SQL.h
 daap_query.c: DAAPLexer.h DAAPParser.h DAAP2SQL.h
 
-
+# Support for building the parsers when ANTLR3 is available
+if COND_ANTLR
 SUFFIXES = .g .u
 
 %.tokens %.c %Lexer.c %Parser.c %Lexer.h %Parser.h %.h: %.g
-	@ANTLR@ $(ANTLR_OPTIONS) $<
+	$(ANTLR) $(ANTLR_OPTIONS) $<
 
 %.u: %.g
-	@ANTLR@ -depend $< > $@
+	$(ANTLR) -depend $< > $@
 	@echo -n "ANTLR_PRODUCTS += " > $@.tmp
 	@grep : $@ | cut -d : -f 1 | tr -d ' ' | { while read f; do test "$$f" != "$<" && echo -n "$$f "; done } >> $@.tmp
 	@cat $@.tmp >> $@
 	@rm $@.tmp
 
 clean-local:
-	-rm $(ANTLR_PRODUCTS)
-	rm $(ANTLR_GRAMMARS:.g=.u)
+	rm -f $(ANTLR_PRODUCTS)
+	rm -f $(ANTLR_GRAMMARS:.g=.u)
+
+else !COND_ANTLR
+distclean-local:
+	rm -f $(ANTLR_SOURCES)
+	rm -f $(ANTLR_GRAMMARS:.g=.u)
+endif
 
 -include $(ANTLR_GRAMMARS:.g=.u)

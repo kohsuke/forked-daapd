@@ -10,8 +10,12 @@ by iTunes and friends to share/stream media libraries over the network.
 RSP is Roku's own media sharing protocol. Roku are the makers of the
 SoundBridge devices. See <http://www.roku.com>.
 
-forked-daapd is a temporary name that should change to something else if
-someone can come up with a good name for it.
+forked-daapd is a working title that will eventually change in the future.
+
+The forked-daapd git tree can be found at:
+  <http://git.debian.org/?p=users/jblache/forked-daapd.git>
+Release tarballs can be downloaded at:
+  <http://alioth.debian.org/~jblache/forked-daapd/>
 
 
 Supported clients
@@ -78,7 +82,40 @@ the correct value:
 The name of your iPod/iPhone is the value of the DvNm field above. In this
 example, the correct value is Foobar.
 
+Watch out for fancy characters; for instance, the name of your device may
+include Unicode characters that aren't visually different from plain ASCII
+characters (like the single quote if your device name follows the default
+scheme of "Foo's iPhone"). If unsure, change the name of your device or
+capture the output in a file to extract the real, correct name.
+
 Hit Ctrl-C to terminate avahi-browse.
+
+
+AirTunes devices
+----------------
+
+forked-daapd will discover the AirTunes devices available on your network. For
+devices that are password-protected, the device's AirTunes name and password
+must be given in the configuration file. See the sample configuration file
+for the syntax.
+
+You should enable IPv6 on the host machine and the AirTunes devices for AirTunes
+to work properly. You do not need to do any configuration on the host machine,
+as link-local communication is all that's needed. Unfortunately, IPv4 link-local
+mostly does (can) not work and Avahi returns IPv4 link-local addresses more
+often than not when discovering AirTunes devices. Any device discovered with
+only an IPv4 link-local address will be ignored as it cannot work anyway.
+
+
+Local audio output
+------------------
+
+The audio section of the configuration file supports 2 parameters for the local
+audio device:
+ - nickname: this is the name that will be used in the speakers list in Remote
+ - card: this is the name/device string (ALSA) or device node (OSS4) to be used
+   as the local audio device. Defaults to "default" for ALSA and "/dev/dsp" for
+   OSS4.
 
 
 Supported formats
@@ -152,26 +189,26 @@ forked-daapd has /some/ support for artwork, with a number of limitations.
 Embedded artwork is not supported; ffmpeg doesn't support this yet, if and
 when this is added to ffmpeg, forked-daapd will support it.
 
-Your artwork must be in PNG format, dimensions do not matter; forked-daapd
-scales down (never up) the artwork on-the-fly to match the constraints given
-by the client. Note, however, that the bigger the picture, the more time and
-ressources it takes to perform the scaling operation.
+Your artwork must be in PNG or JPEG format, dimensions do not matter;
+forked-daapd scales down (never up) the artwork on-the-fly to match the
+constraints given by the client. Note, however, that the bigger the picture,
+the more time and resources it takes to perform the scaling operation.
 
 As for the naming convention, it is quite simple; consider your foo.mp3 song,
 residing at /bar/foo.mp3:
- - if /bar/foo.png exists, this will be the artwork returned for this file;
- - failing that, if /bar/artwork.png exists, it will be used.
+ - if /bar/foo.{png,jpg} exists, this will be used as the artwork for this file;
+ - failing that, if /bar/{artwork,cover}.{png,jpg} exists, it will be used.
 
 For "groups" (same album name and album artist), the situation is a bit
 different:
- - if a file artwork.png is found in one of the directories containing files
-   that are part of the group, it is used as the artwork. The first file found
-   is used, ordering is not guaranteed;
+ - if a file {artwork,cover}.{png,jpg} is found in one of the directories
+   containing files that are part of the group, it is used as the artwork. The
+   first file found is used, ordering is not guaranteed;
  - failing that, individual files are examined and the first artwork found is
    used. Here again, ordering is not guaranteed.
 
 You can use symlinks for the artwork files; the artwork is not scanned/indexed
-in any way in the database and there is no caching.
+in any way in the database and there is no caching on forked-daapd's side.
 
 
 Library

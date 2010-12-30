@@ -40,6 +40,17 @@
 #include "artwork.h"
 
 
+static const char *cover_basename[] =
+  {
+    "artwork", "cover",
+  };
+
+static const char *cover_extension[] =
+  {
+    "png", "jpg",
+  };
+
+
 static int
 artwork_read(char *filename, struct evbuffer *evbuf)
 {
@@ -85,7 +96,7 @@ artwork_read(char *filename, struct evbuffer *evbuf)
 }
 
 static int
-artwork_rescale(AVFormatContext *src_ctx, int s, int max_w, int max_h, struct evbuffer *evbuf)
+artwork_rescale(AVFormatContext *src_ctx, int s, int out_w, int out_h, struct evbuffer *evbuf)
 {
   uint8_t *buf;
   uint8_t *outbuf;
@@ -185,35 +196,8 @@ artwork_rescale(AVFormatContext *src_ctx, int s, int max_w, int max_h, struct ev
   dst->time_base.num = 1;
   dst->time_base.den = 25;
 
-  /* Determine width/height */
-  if (src->width > src->height)
-    {
-      dst->width = max_w;
-      dst->height = (double)max_h * ((double)src->height / (double)src->width);
-    }
-  else if (src->height > src->width)
-    {
-      dst->height = max_h;
-      dst->width = (double)max_w * ((double)src->width / (double)src->height);
-    }
-  else
-    {
-      dst->width = max_w;
-      dst->height = max_h;
-    }
-
-  DPRINTF(E_DBG, L_ART, "Raw destination width %d height %d\n", dst->width, dst->height);
-
-  dst->width += dst->width % 2;
-  dst->height += dst->height % 2;
-
-  if (dst->width > max_w)
-    dst->width = max_w;
-
-  if (dst->height > max_h)
-    dst->height = max_h;
-
-  DPRINTF(E_DBG, L_ART, "Destination width %d height %d\n", dst->width, dst->height);
+  dst->width = out_w;
+  dst->height = out_h;
 
   ret = av_set_parameters(dst_ctx, NULL);
   if (ret < 0)
@@ -415,6 +399,9 @@ artwork_get(char *filename, int max_w, int max_h, struct evbuffer *evbuf)
   AVFormatContext *src_ctx;
   AVCodecContext *src;
   int s;
+  int target_w;
+  int target_h;
+  int need_rescale;
   int ret;
 
   ret = av_open_input_file(&src_ctx, filename, NULL, 0, NULL);
@@ -438,11 +425,13 @@ artwork_get(char *filename, int max_w, int max_h, struct evbuffer *evbuf)
     {
       if (src_ctx->streams[s]->codec->codec_id == CODEC_ID_PNG)
 	break;
+      else if (src_ctx->streams[s]->codec->codec_id == CODEC_ID_MJPEG)
+	break;
     }
 
   if (s == src_ctx->nb_streams)
     {
-      DPRINTF(E_LOG, L_ART, "Artwork file '%s' not a PNG file\n", filename);
+      DPRINTF(E_LOG, L_ART, "Artwork file '%s' not a PNG or JPEG file\n", filename);
 
       av_close_input_file(src_ctx);
       return -1;
@@ -450,12 +439,52 @@ artwork_get(char *filename, int max_w, int max_h, struct evbuffer *evbuf)
 
   src = src_ctx->streams[s]->codec;
 
-  DPRINTF(E_DBG, L_ART, "PNG image '%s': w %d h %d\n", filename, src->width, src->height);
+  DPRINTF(E_DBG, L_ART, "Original image '%s': w %d h %d\n", filename, src->width, src->height);
 
-  if ((src->width <= max_w) && (src->height <= max_h))  
+  need_rescale = 1;
+
+  /* Determine width/height -- assuming max_w == max_h */
+  if ((src->width <= max_w) && (src->height <= max_h))
+    {
+      need_rescale = 0;
+
+      target_w = src->width;
+      target_h = src->height;
+    }
+  else if (src->width > src->height)
+    {
+      target_w = max_w;
+      target_h = (double)max_h * ((double)src->height / (double)src->width);
+    }
+  else if (src->height > src->width)
+    {
+      target_h = max_h;
+      target_w = (double)max_w * ((double)src->width / (double)src->height);
+    }
+  else
+    {
+      target_w = max_w;
+      target_h = max_h;
+    }
+
+  DPRINTF(E_DBG, L_ART, "Raw destination width %d height %d\n", target_w, target_h);
+
+  if (target_h > max_h)
+    target_h = max_h;
+
+  /* PNG prefers even row count */
+  target_w += target_w % 2;
+
+  if (target_w > max_w)
+    target_w = max_w - (max_w % 2);
+
+  DPRINTF(E_DBG, L_ART, "Destination width %d height %d\n", target_w, target_h);
+
+  /* Fastpath for PNG */
+  if ((src->codec_id == CODEC_ID_PNG) && !need_rescale)
     ret = artwork_read(filename, evbuf);
   else
-    ret = artwork_rescale(src_ctx, s, max_w, max_h, evbuf);
+    ret = artwork_rescale(src_ctx, s, target_w, target_h, evbuf);
 
   av_close_input_file(src_ctx);
 
@@ -470,11 +499,12 @@ artwork_get(char *filename, int max_w, int max_h, struct evbuffer *evbuf)
 
 
 static int
-artwork_get_own_png(char *path, int max_w, int max_h, struct evbuffer *evbuf)
+artwork_get_own_image(char *path, int max_w, int max_h, struct evbuffer *evbuf)
 {
   char artwork[PATH_MAX];
   char *ptr;
   int len;
+  int i;
   int ret;
 
   ret = snprintf(artwork, sizeof(artwork), "%s", path);
@@ -491,30 +521,38 @@ artwork_get_own_png(char *path, int max_w, int max_h, struct evbuffer *evbuf)
 
   len = strlen(artwork);
 
-  ret = snprintf(artwork + len, sizeof(artwork) - len, "%s", ".png");
-  if ((ret < 0) || (ret >= sizeof(artwork) - len))
+  for (i = 0; i < (sizeof(cover_extension) / sizeof(cover_extension[0])); i++)
     {
-      DPRINTF(E_INFO, L_ART, "Artwork path exceeds PATH_MAX\n");
+      ret = snprintf(artwork + len, sizeof(artwork) - len, ".%s", cover_extension[i]);
+      if ((ret < 0) || (ret >= sizeof(artwork) - len))
+	{
+	  DPRINTF(E_INFO, L_ART, "Artwork path exceeds PATH_MAX (ext %s)\n", cover_extension[i]);
 
-      return -1;
+	  continue;
+	}
+
+      DPRINTF(E_DBG, L_ART, "Trying own artwork file %s\n", artwork);
+
+      ret = access(artwork, F_OK);
+      if (ret < 0)
+	continue;
+
+      break;
     }
 
-  DPRINTF(E_DBG, L_ART, "Trying own artwork file %s\n", artwork);
-
-  ret = access(artwork, F_OK);
-  if (ret < 0)
+  if (i == (sizeof(cover_extension) / sizeof(cover_extension[0])))
     return -1;
 
-  ret = artwork_get(artwork, max_w, max_h, evbuf);
-
-  return ret;
+  return artwork_get(artwork, max_w, max_h, evbuf);
 }
 
 static int
-artwork_get_dir_png(char *path, int isdir, int max_w, int max_h, struct evbuffer *evbuf)
+artwork_get_dir_image(char *path, int isdir, int max_w, int max_h, struct evbuffer *evbuf)
 {
   char artwork[PATH_MAX];
   char *ptr;
+  int i;
+  int j;
   int len;
   int ret;
 
@@ -535,23 +573,35 @@ artwork_get_dir_png(char *path, int isdir, int max_w, int max_h, struct evbuffer
 
   len = strlen(artwork);
 
-  ret = snprintf(artwork + len, sizeof(artwork) - len, "%s", "/artwork.png");
-  if ((ret < 0) || (ret >= sizeof(artwork) - len))
+  for (i = 0; i < (sizeof(cover_basename) / sizeof(cover_basename[0])); i++)
     {
-      DPRINTF(E_INFO, L_ART, "Artwork path exceeds PATH_MAX\n");
+      for (j = 0; j < (sizeof(cover_extension) / sizeof(cover_extension[0])); j++)
+	{
+	  ret = snprintf(artwork + len, sizeof(artwork) - len, "/%s.%s", cover_basename[i], cover_extension[j]);
+	  if ((ret < 0) || (ret >= sizeof(artwork) - len))
+	    {
+	      DPRINTF(E_INFO, L_ART, "Artwork path exceeds PATH_MAX (%s.%s)\n", cover_basename[i], cover_extension[j]);
 
-      return -1;
+	      continue;
+	    }
+
+	  DPRINTF(E_DBG, L_ART, "Trying directory artwork file %s\n", artwork);
+
+	  ret = access(artwork, F_OK);
+	  if (ret < 0)
+	    continue;
+
+	  break;
+	}
+
+      if (j < (sizeof(cover_extension) / sizeof(cover_extension[0])))
+	break;
     }
 
-  DPRINTF(E_DBG, L_ART, "Trying directory artwork file %s\n", artwork);
-
-  ret = access(artwork, F_OK);
-  if (ret < 0)
+  if (i == (sizeof(cover_basename) / sizeof(cover_basename[0])))
     return -1;
 
-  ret = artwork_get(artwork, max_w, max_h, evbuf);
-
-  return ret;
+  return artwork_get(artwork, max_w, max_h, evbuf);
 }
 
 
@@ -569,13 +619,13 @@ artwork_get_item(int id, int max_w, int max_h, struct evbuffer *evbuf)
 
   /* FUTURE: look at embedded artwork */
 
-  /* Look for basename(filename).png */
-  ret = artwork_get_own_png(filename, max_w, max_h, evbuf);
+  /* Look for basename(filename).{png,jpg} */
+  ret = artwork_get_own_image(filename, max_w, max_h, evbuf);
   if (ret == 0)
     goto out;
 
-  /* Look for basedir(filename)/artwork.png */
-  ret = artwork_get_dir_png(filename, 0, max_w, max_h, evbuf);
+  /* Look for basedir(filename)/{artwork,cover}.{png,jpg} */
+  ret = artwork_get_dir_image(filename, 0, max_w, max_h, evbuf);
   if (ret == 0)
     goto out;
 
@@ -617,7 +667,7 @@ artwork_get_group(int id, int max_w, int max_h, struct evbuffer *evbuf)
   got_art = 0;
   while ((!got_art) && ((ret = db_query_fetch_string(&qp, &dir)) == 0) && (dir))
     {
-      got_art = ! artwork_get_dir_png(dir, 1, max_w, max_h, evbuf);
+      got_art = ! artwork_get_dir_image(dir, 1, max_w, max_h, evbuf);
     }
 
   db_query_end(&qp);
@@ -646,7 +696,7 @@ artwork_get_group(int id, int max_w, int max_h, struct evbuffer *evbuf)
   got_art = 0;
   while ((!got_art) && ((ret = db_query_fetch_file(&qp, &dbmfi)) == 0) && (dbmfi.id))
     {
-      got_art = ! artwork_get_own_png(dbmfi.path, max_w, max_h, evbuf);
+      got_art = ! artwork_get_own_image(dbmfi.path, max_w, max_h, evbuf);
     }
 
   db_query_end(&qp);

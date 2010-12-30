@@ -41,6 +41,7 @@
 # include <sys/eventfd.h>
 #endif
 
+#include <zlib.h>
 #include <event.h>
 #include "evhttp/evhttp.h"
 
@@ -128,7 +129,8 @@ static pthread_t tid_httpd;
 static void
 stream_end(struct stream_ctx *st, int failed)
 {
-  evhttp_connection_set_closecb(st->req->evcon, NULL, NULL);
+  if (st->req->evcon)
+    evhttp_connection_set_closecb(st->req->evcon, NULL, NULL);
 
   if (!failed)
     evhttp_send_reply_end(st->req);
@@ -144,6 +146,18 @@ stream_end(struct stream_ctx *st, int failed)
     }
 
   free(st);
+}
+
+static void
+stream_up_playcount(struct stream_ctx *st)
+{
+  if (!st->marked
+      && (st->stream_size > ((st->size * 50) / 100))
+      && (st->offset > ((st->size * 80) / 100)))
+    {
+      st->marked = 1;
+      db_file_inc_playcount(st->id);
+    }
 }
 
 static void
@@ -200,9 +214,6 @@ stream_chunk_xcode_cb(int fd, short event, void *arg)
 	  st->offset += ret;
 
 	  ret = xcoded - ret;
-
-	  if (ret == 0)
-	    goto consume;
 	}
       else
 	{
@@ -219,13 +230,7 @@ stream_chunk_xcode_cb(int fd, short event, void *arg)
 
   st->offset += ret;
 
-  if (!st->marked
-      && (st->stream_size > ((st->size * 50) / 100))
-      && (st->offset > ((st->size * 80) / 100)))
-    {
-      st->marked = 1;
-      db_file_inc_playcount(st->id);
-    }
+  stream_up_playcount(st);
 
   return;
 
@@ -281,13 +286,7 @@ stream_chunk_raw_cb(int fd, short event, void *arg)
 
   st->offset += ret;
 
-  if (!st->marked
-      && (st->stream_size > ((st->size * 50) / 100))
-      && (st->offset > ((st->size * 80) / 100)))
-    {
-      st->marked = 1;
-      db_file_inc_playcount(st->id);
-    }
+  stream_up_playcount(st);
 }
 
 static void
@@ -396,7 +395,7 @@ httpd_stream_file(struct evhttp_request *req, int id)
 
       stream_cb = stream_chunk_xcode_cb;
 
-      st->xcode = transcode_setup(mfi, &st->size);
+      st->xcode = transcode_setup(mfi, &st->size, 1);
       if (!st->xcode)
 	{
 	  DPRINTF(E_WARN, L_HTTPD, "Transcoding setup failed, aborting streaming\n");
@@ -606,6 +605,124 @@ httpd_stream_file(struct evhttp_request *req, int id)
 }
 
 /* Thread: httpd */
+void
+httpd_send_reply(struct evhttp_request *req, int code, const char *reason, struct evbuffer *evbuf)
+{
+  unsigned char outbuf[128 * 1024];
+  z_stream strm;
+  struct evbuffer *gzbuf;
+  const char *param;
+  int flush;
+  int zret;
+  int ret;
+
+  if (!evbuf || (EVBUFFER_LENGTH(evbuf) == 0))
+    {
+      DPRINTF(E_DBG, L_HTTPD, "Not gzipping body-less reply\n");
+
+      goto no_gzip;
+    }
+
+  param = evhttp_find_header(req->input_headers, "Accept-Encoding");
+  if (!param)
+    {
+      DPRINTF(E_DBG, L_HTTPD, "Not gzipping; no Accept-Encoding header\n");
+
+      goto no_gzip;
+    }
+  else if (!strstr(param, "gzip") && !strstr(param, "*"))
+    {
+      DPRINTF(E_DBG, L_HTTPD, "Not gzipping; gzip not in Accept-Encoding (%s)\n", param);
+
+      goto no_gzip;
+    }
+
+  gzbuf = evbuffer_new();
+  if (!gzbuf)
+    {
+      DPRINTF(E_LOG, L_HTTPD, "Could not allocate evbuffer for gzipped reply\n");
+
+      goto no_gzip;
+    }
+
+  strm.zalloc = Z_NULL;
+  strm.zfree = Z_NULL;
+  strm.opaque = Z_NULL;
+
+  /* Set up a gzip stream (the "+ 16" in 15 + 16), instead of a zlib stream (default) */
+  zret = deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY);
+  if (zret != Z_OK)
+    {
+      DPRINTF(E_DBG, L_HTTPD, "zlib setup failed: %s\n", zError(zret));
+
+      goto out_fail_init;
+    }
+
+  strm.next_in = EVBUFFER_DATA(evbuf);
+  strm.avail_in = EVBUFFER_LENGTH(evbuf);
+
+  flush = Z_NO_FLUSH;
+
+  /* 2 iterations: Z_NO_FLUSH until input is consumed, then Z_FINISH */
+  for (;;)
+    {
+      do
+	{
+	  strm.next_out = outbuf;
+	  strm.avail_out = sizeof(outbuf);
+
+	  zret = deflate(&strm, flush);
+	  if (zret == Z_STREAM_ERROR)
+	    {
+	      DPRINTF(E_LOG, L_HTTPD, "Could not deflate data: %s\n", strm.msg);
+
+	      goto out_fail_gz;
+	    }
+
+	  ret = evbuffer_add(gzbuf, outbuf, sizeof(outbuf) - strm.avail_out);
+	  if (ret < 0)
+	    {
+	      DPRINTF(E_LOG, L_HTTPD, "Out of memory adding gzipped data to evbuffer\n");
+
+	      goto out_fail_gz;
+	    }
+	}
+      while (strm.avail_out == 0);
+
+      if (flush == Z_FINISH)
+	break;
+
+      flush = Z_FINISH;
+    }
+
+  if (zret != Z_STREAM_END)
+    {
+      DPRINTF(E_LOG, L_HTTPD, "Compressed data not finalized!\n");
+
+      goto out_fail_gz;
+    }
+
+  deflateEnd(&strm);
+
+  evhttp_add_header(req->output_headers, "Content-Encoding", "gzip");
+  evhttp_send_reply(req, code, reason, gzbuf);
+
+  evbuffer_free(gzbuf);
+
+  /* Drain original buffer, as would be after evhttp_send_reply() */
+  evbuffer_drain(evbuf, EVBUFFER_LENGTH(evbuf));
+
+  return;
+
+ out_fail_gz:
+  deflateEnd(&strm);
+ out_fail_init:
+  evbuffer_free(gzbuf);
+ no_gzip:
+  evhttp_send_reply(req, code, reason, evbuf);
+}
+
+/* Thread: httpd */
 static int
 path_is_legal(char *path)
 {
@@ -664,7 +781,8 @@ serve_file(struct evhttp_request *req, char *uri)
     }
   else
     {
-      if (strcmp(req->remote_host, "127.0.0.1") != 0)
+      if ((strcmp(req->remote_host, "::1") != 0)
+	  && (strcmp(req->remote_host, "127.0.0.1") != 0))
 	{
 	  DPRINTF(E_LOG, L_HTTPD, "Remote web interface request denied; no password set\n");
 
@@ -971,7 +1089,7 @@ httpd_fixup_uri(struct evhttp_request *req)
   return fixed;
 }
 
-static char *http_reply_401 = "<html><head><title>401 Unauthorized</title></head><body>Authorization required</body></html>";
+static const char *http_reply_401 = "<html><head><title>401 Unauthorized</title></head><body>Authorization required</body></html>";
 
 int
 httpd_basic_auth(struct evhttp_request *req, char *user, char *passwd, char *realm)
@@ -1082,17 +1200,24 @@ int
 httpd_init(void)
 {
   unsigned short port;
-  int bindv6;
   int ret;
 
   httpd_exit = 0;
+
+  evbase_httpd = event_base_new();
+  if (!evbase_httpd)
+    {
+      DPRINTF(E_FATAL, L_HTTPD, "Could not create an event base\n");
+
+      return -1;
+    }
 
   ret = rsp_init();
   if (ret < 0)
     {
       DPRINTF(E_FATAL, L_HTTPD, "RSP protocol init failed\n");
 
-      return -1;
+      goto rsp_fail;
     }
 
   ret = daap_init();
@@ -1133,14 +1258,6 @@ httpd_init(void)
     }
 #endif /* USE_EVENTFD */
 
-  evbase_httpd = event_base_new();
-  if (!evbase_httpd)
-    {
-      DPRINTF(E_FATAL, L_HTTPD, "Could not create an event base\n");
-
-      goto evbase_fail;
-    }
-
 #ifdef USE_EVENTFD
   event_set(&exitev, exit_efd, EV_READ, exit_cb, NULL);
 #else
@@ -1159,21 +1276,21 @@ httpd_init(void)
 
   port = cfg_getint(cfg_getsec(cfg, "library"), "port");
 
-  /* evhttp doesn't support IPv6 yet, so this is expected to fail */
-  bindv6 = evhttp_bind_socket(evhttpd, "::", port);
-  if (bindv6 < 0)
-    DPRINTF(E_INFO, L_HTTPD, "Could not bind IN6ADDR_ANY:%d (that's OK)\n", port);
-
+  /* We are binding v6 and v4 separately, and we allow v6 to fail
+   * as IPv6 might not be supported on the system.
+   * We still warn about the failure, in case there's another issue.
+   */
   ret = evhttp_bind_socket(evhttpd, "0.0.0.0", port);
   if (ret < 0)
     {
-      if (bindv6 < 0)
-	{
-	  DPRINTF(E_FATAL, L_HTTPD, "Could not bind INADDR_ANY:%d\n", port);
+      DPRINTF(E_FATAL, L_HTTPD, "Could not bind INADDR_ANY:%d\n", port);
 
-	  goto bind_fail;
-	}
+      goto bind_fail;
     }
+
+  ret = evhttp_bind_socket(evhttpd, "::", port);
+  if (ret < 0)
+    DPRINTF(E_WARN, L_HTTPD, "Could not bind IN6ADDR_ANY:%d (that's OK)\n", port);
 
   evhttp_set_gencb(evhttpd, httpd_gen_cb, NULL);
 
@@ -1191,8 +1308,6 @@ httpd_init(void)
  bind_fail:
   evhttp_free(evhttpd);
  evhttp_fail:
-  event_base_free(evbase_httpd);
- evbase_fail:
 #ifdef USE_EVENTFD
   close(exit_efd);
 #else
@@ -1205,6 +1320,8 @@ httpd_init(void)
   daap_deinit();
  daap_fail:
   rsp_deinit();
+ rsp_fail:
+  event_base_free(evbase_httpd);
 
   return -1;
 }

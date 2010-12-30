@@ -37,6 +37,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <errno.h>
 #include <pthread.h>
 
@@ -45,8 +46,6 @@
 # include <sys/eventfd.h>
 #endif
 
-#include <avahi-common/malloc.h>
-
 #include <event.h>
 #include "evhttp/evhttp.h"
 
@@ -54,7 +53,7 @@
 
 #include "logger.h"
 #include "conffile.h"
-#include "mdns_avahi.h"
+#include "mdns.h"
 #include "misc.h"
 #include "db.h"
 #include "remote_pairing.h"
@@ -66,8 +65,10 @@ struct remote_info {
   char *paircode;
   char *pin;
 
-  int port;
-  char *address;
+  unsigned short v4_port;
+  unsigned short v6_port;
+  char *v4_address;
+  char *v6_address;
 
   struct evhttp_connection *evcon;
 
@@ -86,7 +87,6 @@ static int pairing_pipe[2];
 static struct event pairingev;
 static pthread_mutex_t remote_lck = PTHREAD_MUTEX_INITIALIZER;
 static struct remote_info *remote_list;
-static uint64_t libhash;
 
 
 /* iTunes - Remote pairing hash */
@@ -205,8 +205,11 @@ free_remote(struct remote_info *ri)
   if (ri->pin)
     free(ri->pin);
 
-  if (ri->address)
-    free(ri->address);
+  if (ri->v4_address)
+    free(ri->v4_address);
+
+  if (ri->v6_address)
+    free(ri->v6_address);
 
   free_pi(&ri->pi, 1);
 
@@ -222,7 +225,7 @@ remove_remote(struct remote_info *ri)
 }
 
 static void
-remove_remote_byid(const char *id)
+remove_remote_address_byid(const char *id, int family)
 {
   struct remote_info *ri;
 
@@ -241,13 +244,34 @@ remove_remote_byid(const char *id)
       return;
     }
 
-  remove_remote(ri);
+  switch (family)
+    {
+      case AF_INET:
+	if (ri->v4_address)
+	  {
+	    free(ri->v4_address);
+	    ri->v4_address = NULL;
+	  }
+	break;
+
+      case AF_INET6:
+	if (ri->v6_address)
+	  {
+	    free(ri->v6_address);
+	    ri->v6_address = NULL;
+	  }
+	break;
+    }
+
+  if (!ri->v4_address && !ri->v6_address)
+    remove_remote(ri);
 }
 
 static int
-add_remote_mdns_data(const char *id, const char *address, int port, char *name, char *paircode)
+add_remote_mdns_data(const char *id, int family, const char *address, int port, char *name, char *paircode)
 {
   struct remote_info *ri;
+  char *check_addr;
   int ret;
 
   for (ri = remote_list; ri; ri = ri->next)
@@ -275,8 +299,18 @@ add_remote_mdns_data(const char *id, const char *address, int port, char *name, 
 
       free_pi(&ri->pi, 1);
 
-      if (ri->address)
-	free(ri->address);
+      switch (family)
+	{
+	  case AF_INET:
+	    if (ri->v4_address)
+	      free(ri->v4_address);
+	    break;
+
+	  case AF_INET6:
+	    if (ri->v6_address)
+	      free(ri->v6_address);
+	    break;
+	}
 
       if (ri->paircode)
 	free(ri->paircode);
@@ -285,9 +319,25 @@ add_remote_mdns_data(const char *id, const char *address, int port, char *name, 
     }
 
   ri->pi.remote_id = strdup(id);
-  ri->address = strdup(address);
 
-  if (!ri->pi.remote_id || !ri->address)
+  switch (family)
+    {
+      case AF_INET:
+	ri->v4_address = strdup(address);
+	ri->v4_port = port;
+
+	check_addr = ri->v4_address;
+	break;
+
+      case AF_INET6:
+	ri->v6_address = strdup(address);
+	ri->v6_port = port;
+
+	check_addr = ri->v6_address;
+	break;
+    }
+
+  if (!ri->pi.remote_id || !check_addr)
     {
       DPRINTF(E_LOG, L_REMOTE, "Out of memory for remote pairing data\n");
 
@@ -296,7 +346,6 @@ add_remote_mdns_data(const char *id, const char *address, int port, char *name, 
     }
 
   ri->pi.name = name;
-  ri->port = port;
   ri->paircode = paircode;
 
   return ret;
@@ -349,6 +398,370 @@ kickoff_pairing(void)
 #endif
 }
 
+
+/* Thread: main (pairing) */
+static void
+pairing_request_cb(struct evhttp_request *req, void *arg)
+{
+  struct remote_info *ri;
+  uint8_t *response;
+  char guid[17];
+  int len;
+  int i;
+  int ret;
+
+  ri = (struct remote_info *)arg;
+
+  if (!req)
+    goto cleanup;
+
+  if (req->response_code != HTTP_OK)
+    {
+      DPRINTF(E_LOG, L_REMOTE, "Pairing failed with Remote %s/%s, HTTP response code %d\n", ri->pi.remote_id, ri->pi.name, req->response_code);
+
+      goto cleanup;
+    }
+
+  if (EVBUFFER_LENGTH(req->input_buffer) < 8)
+    {
+      DPRINTF(E_LOG, L_REMOTE, "Remote %s/%s: pairing response too short\n", ri->pi.remote_id, ri->pi.name);
+
+      goto cleanup;
+    }
+
+  response = EVBUFFER_DATA(req->input_buffer);
+
+  if ((response[0] != 'c') || (response[1] != 'm') || (response[2] != 'p') || (response[3] != 'a'))
+    {
+      DPRINTF(E_LOG, L_REMOTE, "Remote %s/%s: unknown pairing response, expected cmpa\n", ri->pi.remote_id, ri->pi.name);
+
+      goto cleanup;
+    }
+
+  len = (response[4] << 24) | (response[5] << 16) | (response[6] << 8) | (response[7]);
+  if (EVBUFFER_LENGTH(req->input_buffer) < 8 + len)
+    {
+      DPRINTF(E_LOG, L_REMOTE, "Remote %s/%s: pairing response truncated (got %d expected %d)\n",
+	      ri->pi.remote_id, ri->pi.name, (int)EVBUFFER_LENGTH(req->input_buffer), len + 8);
+
+      goto cleanup;
+    }
+
+  response += 8;
+
+  for (; len > 0; len--, response++)
+    {
+      if ((response[0] != 'c') || (response[1] != 'm') || (response[2] != 'p') || (response[3] != 'g'))
+	continue;
+      else
+	{
+	  len -= 8;
+	  response += 8;
+
+	  break;
+	}
+    }
+
+  if (len < 8)
+    {
+      DPRINTF(E_LOG, L_REMOTE, "Remote %s/%s: cmpg truncated in pairing response\n", ri->pi.remote_id, ri->pi.name);
+
+      goto cleanup;
+    }
+
+  for (i = 0; i < 8; i++)
+    sprintf(guid + (2 * i), "%02X", response[i]);
+
+  ri->pi.guid = strdup(guid);
+
+  DPRINTF(E_INFO, L_REMOTE, "Pairing succeeded with Remote '%s' (id %s), GUID: %s\n", ri->pi.name, ri->pi.remote_id, guid);
+
+  ret = db_pairing_add(&ri->pi);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_REMOTE, "Failed to register pairing!\n");
+
+      goto cleanup;
+    }
+
+ cleanup:
+  evhttp_connection_free(ri->evcon);
+  free_remote(ri);
+}
+
+
+/* Thread: main (pairing) */
+static int
+send_pairing_request(struct remote_info *ri, char *req_uri, int family)
+{
+  struct evhttp_connection *evcon;
+  struct evhttp_request *req;
+  char *address;
+  unsigned short port;
+  int ret;
+
+  switch (family)
+    {
+      case AF_INET:
+	if (!ri->v4_address)
+	  return -1;
+
+	address = ri->v4_address;
+	port = ri->v4_port;
+	break;
+
+      case AF_INET6:
+	if (!ri->v6_address)
+	  return -1;
+
+	address = ri->v6_address;
+	port = ri->v6_port;
+	break;
+
+      default:
+	return -1;
+    }
+
+  evcon = evhttp_connection_new(address, port);
+  if (!evcon)
+    {
+      DPRINTF(E_LOG, L_REMOTE, "Could not create connection for pairing with %s\n", ri->pi.name);
+
+      return -1;
+    }
+
+  evhttp_connection_set_base(evcon, evbase_main);
+
+  req = evhttp_request_new(pairing_request_cb, ri);
+  if (!req)
+    {
+      DPRINTF(E_WARN, L_REMOTE, "Could not create HTTP request for pairing\n");
+
+      goto request_fail;
+    }
+
+  ret = evhttp_make_request(evcon, req, EVHTTP_REQ_GET, req_uri);
+  if (ret < 0)
+    {
+      DPRINTF(E_WARN, L_REMOTE, "Could not make pairing request\n");
+
+      goto request_fail;
+    }
+
+  ri->evcon = evcon;
+
+  return 0;
+
+ request_fail:
+  evhttp_connection_free(evcon);
+
+  return -1;
+}
+
+/* Thread: main (pairing) */
+static void
+do_pairing(struct remote_info *ri)
+{
+  char req_uri[128];
+  char *pairing_hash;
+  int ret;
+
+  pairing_hash = itunes_pairing_hash(ri->paircode, ri->pin);
+  if (!pairing_hash)
+    {
+      DPRINTF(E_LOG, L_REMOTE, "Could not compute pairing hash!\n");
+
+      goto hash_fail;
+    }
+
+  DPRINTF(E_DBG, L_REMOTE, "Pairing hash for %s/%s: %s\n", ri->pi.remote_id, ri->pi.name, pairing_hash);
+
+  /* Prepare request URI */
+  /* The servicename variable is the mDNS service group name; currently it's
+   * a hash of the library name, but in iTunes the service name and the library
+   * ID (DbId) are different (see comment in main.c).
+   * Remote uses the service name to perform mDNS lookups.
+   */
+  ret = snprintf(req_uri, sizeof(req_uri), "/pair?pairingcode=%s&servicename=%016" PRIX64, pairing_hash, libhash);
+  free(pairing_hash);
+  if ((ret < 0) || (ret >= sizeof(req_uri)))
+    {
+      DPRINTF(E_WARN, L_REMOTE, "Request URI for pairing exceeds buffer size\n");
+
+      goto req_uri_fail;
+    }
+
+  /* Fire up the request */
+  if (ri->v6_address)
+    {
+      ret = send_pairing_request(ri, req_uri, AF_INET6);
+      if (ret == 0)
+	return;
+
+      DPRINTF(E_WARN, L_REMOTE, "Could not send pairing request on IPv6\n");
+    }
+
+  ret = send_pairing_request(ri, req_uri, AF_INET);
+  if (ret < 0)
+    {
+      DPRINTF(E_WARN, L_REMOTE, "Could not send pairing request on IPv4\n");
+
+      goto pairing_fail;
+    }
+
+  return;
+
+ pairing_fail:
+ req_uri_fail:
+ hash_fail:
+  free_remote(ri);
+}
+
+
+/* Thread: main (pairing) */
+static void
+pairing_cb(int fd, short event, void *arg)
+{
+  struct remote_info *ri;
+
+#ifdef USE_EVENTFD
+  eventfd_t count;
+  int ret;
+
+  ret = eventfd_read(pairing_efd, &count);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_REMOTE, "Could not read event counter: %s\n", strerror(errno));
+      return;
+    }
+#else
+  int dummy;
+
+  /* Drain the pipe */
+  while (read(pairing_pipe[0], &dummy, sizeof(dummy)) >= 0)
+    ; /* EMPTY */
+#endif
+
+  for (;;)
+    {
+      pthread_mutex_lock(&remote_lck);
+
+      for (ri = remote_list; ri; ri = ri->next)
+	{
+	  /* We've got both the mDNS data and the pin */
+	  if (ri->paircode && ri->pin)
+	    {
+	      unlink_remote(ri);
+	      break;
+	    }
+	}
+
+      pthread_mutex_unlock(&remote_lck);
+
+      if (!ri)
+	break;
+
+      do_pairing(ri);
+    }
+
+  event_add(&pairingev, NULL);
+}
+
+
+/* Thread: main (mdns) */
+static void
+touch_remote_cb(const char *name, const char *type, const char *domain, const char *hostname, int family, const char *address, int port, struct keyval *txt)
+{
+  const char *p;
+  char *devname;
+  char *paircode;
+  int ret;
+
+  if (port < 0)
+    {
+      /* If Remote stops advertising itself, the pairing either succeeded or
+       * failed; any subsequent attempt will need a new pairing pin, so
+       * we can just forget everything we know about the remote.
+       */
+      pthread_mutex_lock(&remote_lck);
+
+      remove_remote_address_byid(name, family);
+
+      pthread_mutex_unlock(&remote_lck);
+    }
+  else
+    {
+      /* Get device name (DvNm field in TXT record) */
+      p = keyval_get(txt, "DvNm");
+      if (!p)
+	{
+	  DPRINTF(E_LOG, L_REMOTE, "Remote %s: no DvNm in TXT record!\n", name);
+
+	  return;
+	}
+
+      if (*p == '\0')
+	{
+	  DPRINTF(E_LOG, L_REMOTE, "Remote %s: DvNm has no value\n", name);
+
+	  return;
+	}
+
+      devname = strdup(p);
+      if (!devname)
+	{
+	  DPRINTF(E_LOG, L_REMOTE, "Out of memory for device name\n");
+
+	  return;
+	}
+
+      /* Get pairing code (Pair field in TXT record) */
+      p = keyval_get(txt, "Pair");
+      if (!p)
+	{
+	  DPRINTF(E_LOG, L_REMOTE, "Remote %s: no Pair in TXT record!\n", name);
+
+	  free(devname);
+	  return;
+	}
+
+      if (*p == '\0')
+	{
+	  DPRINTF(E_LOG, L_REMOTE, "Remote %s: Pair has no value\n", name);
+
+	  free(devname);
+	  return;
+	}
+
+      paircode = strdup(p);
+      if (!paircode)
+	{
+	  DPRINTF(E_LOG, L_REMOTE, "Out of memory for paircode\n");
+
+	  free(devname);
+	  return;
+	}
+
+      DPRINTF(E_DBG, L_REMOTE, "Discovered remote %s (id %s) at [%s]:%d, paircode %s\n", devname, name, address, port, paircode);
+
+      /* Add the data to the list, adding the remote to the list if needed */
+      pthread_mutex_lock(&remote_lck);
+
+      ret = add_remote_mdns_data(name, family, address, port, devname, paircode);
+
+      if (ret < 0)
+	{
+	  DPRINTF(E_WARN, L_REMOTE, "Could not add Remote mDNS data, id %s\n", name);
+
+	  free(devname);
+	  free(paircode);
+	}
+      else if (ret == 1)
+	kickoff_pairing();
+
+      pthread_mutex_unlock(&remote_lck);
+    }
+}
 
 /* Thread: filescanner */
 void
@@ -446,336 +859,10 @@ remote_pairing_read_pin(char *path)
 }
 
 
-/* Thread: main (mdns) */
-static void
-touch_remote_cb(const char *name, const char *type, const char *domain, const char *hostname, const char *address, int port, AvahiStringList *txt)
-{
-  AvahiStringList *p;
-  char *devname;
-  char *paircode;
-  char *key;
-  char *val;
-  size_t valsz;
-  int ret;
-
-  if (port < 0)
-    {
-      /* If Remote stops advertising itself, the pairing either succeeded or
-       * failed; any subsequent attempt will need a new pairing pin, so
-       * we can just forget everything we know about the remote.
-       */
-      pthread_mutex_lock(&remote_lck);
-
-      remove_remote_byid(name);
-
-      pthread_mutex_unlock(&remote_lck);
-    }
-  else
-    {
-      /* Get device name (DvNm field in TXT record) */
-      p = avahi_string_list_find(txt, "DvNm");
-      if (!p)
-	{
-	  DPRINTF(E_LOG, L_REMOTE, "Remote %s: no DvNm in TXT record!\n", name);
-
-	  return;
-	}
-
-      avahi_string_list_get_pair(p, &key, &val, &valsz);
-      avahi_free(key);
-      if (!val)
-	{
-	  DPRINTF(E_LOG, L_REMOTE, "Remote %s: DvNm has no value\n", name);
-
-	  return;
-	}
-
-      devname = strndup(val, valsz);
-      avahi_free(val);
-      if (!devname)
-	{
-	  DPRINTF(E_LOG, L_REMOTE, "Out of memory for device name\n");
-
-	  return;
-	}
-
-      /* Get pairing code (Pair field in TXT record) */
-      p = avahi_string_list_find(txt, "Pair");
-      if (!p)
-	{
-	  DPRINTF(E_LOG, L_REMOTE, "Remote %s: no Pair in TXT record!\n", name);
-
-	  free(devname);
-	  return;
-	}
-
-      avahi_string_list_get_pair(p, &key, &val, &valsz);
-      avahi_free(key);
-      if (!val)
-	{
-	  DPRINTF(E_LOG, L_REMOTE, "Remote %s: Pair has no value\n", name);
-
-	  free(devname);
-	  return;
-	}
-
-      paircode = strndup(val, valsz);
-      avahi_free(val);
-      if (!paircode)
-	{
-	  DPRINTF(E_LOG, L_REMOTE, "Out of memory for paircode\n");
-
-	  free(devname);
-	  return;
-	}
-
-      DPRINTF(E_DBG, L_REMOTE, "Discovered remote %s (id %s) at %s:%d, paircode %s\n", devname, name, address, port, paircode);
-
-      /* Add the data to the list, adding the remote to the list if needed */
-      pthread_mutex_lock(&remote_lck);
-
-      ret = add_remote_mdns_data(name, address, port, devname, paircode);
-
-      if (ret < 0)
-	{
-	  DPRINTF(E_WARN, L_REMOTE, "Could not add Remote mDNS data, id %s\n", name);
-
-	  free(devname);
-	  free(paircode);
-	}
-      else if (ret == 1)
-	kickoff_pairing();
-
-      pthread_mutex_unlock(&remote_lck);
-    }
-}
-
-
-/* Thread: main (pairing) */
-static void
-pairing_request_cb(struct evhttp_request *req, void *arg)
-{
-  struct remote_info *ri;
-  uint8_t *response;
-  char guid[17];
-  int len;
-  int i;
-  int ret;
-
-  ri = (struct remote_info *)arg;
-
-  if (!req)
-    goto cleanup;
-
-  if (req->response_code != HTTP_OK)
-    {
-      DPRINTF(E_LOG, L_REMOTE, "Pairing failed with Remote %s/%s, HTTP response code %d\n", ri->pi.remote_id, ri->pi.name, req->response_code);
-
-      goto cleanup;
-    }
-
-  if (EVBUFFER_LENGTH(req->input_buffer) < 8)
-    {
-      DPRINTF(E_LOG, L_REMOTE, "Remote %s/%s: pairing response too short\n", ri->pi.remote_id, ri->pi.name);
-
-      goto cleanup;
-    }
-
-  response = EVBUFFER_DATA(req->input_buffer);
-
-  if ((response[0] != 'c') || (response[1] != 'm') || (response[2] != 'p') || (response[3] != 'a'))
-    {
-      DPRINTF(E_LOG, L_REMOTE, "Remote %s/%s: unknown pairing response, expected cmpa\n", ri->pi.remote_id, ri->pi.name);
-
-      goto cleanup;
-    }
-
-  len = (response[4] << 24) | (response[5] << 16) | (response[6] << 8) | (response[7]);
-  if (EVBUFFER_LENGTH(req->input_buffer) < 8 + len)
-    {
-      DPRINTF(E_LOG, L_REMOTE, "Remote %s/%s: pairing response truncated (got %d expected %d)\n",
-	      ri->pi.remote_id, ri->pi.name, (int)EVBUFFER_LENGTH(req->input_buffer), len + 8);
-
-      goto cleanup;
-    }
-
-  response += 8;
-
-  for (; len > 0; len--, response++)
-    {
-      if ((response[0] != 'c') || (response[1] != 'm') || (response[2] != 'p') || (response[3] != 'g'))
-	continue;
-      else
-	{
-	  len -= 8;
-	  response += 8;
-
-	  break;
-	}
-    }
-
-  if (len < 8)
-    {
-      DPRINTF(E_LOG, L_REMOTE, "Remote %s/%s: cmpg truncated in pairing response\n", ri->pi.remote_id, ri->pi.name);
-
-      goto cleanup;
-    }
-
-  for (i = 0; i < 8; i++)
-    sprintf(guid + (2 * i), "%02X", response[i]);
-
-  ri->pi.guid = strdup(guid);
-
-  DPRINTF(E_INFO, L_REMOTE, "Pairing succeeded with Remote '%s' (id %s), GUID: %s\n", ri->pi.name, ri->pi.remote_id, guid);
-
-  ret = db_pairing_add(&ri->pi);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_REMOTE, "Failed to register pairing!\n");
-
-      goto cleanup;
-    }
-
- cleanup:
-  evhttp_connection_free(ri->evcon);
-  free_remote(ri);
-}
-
-
-/* Thread: main (pairing) */
-static void
-do_pairing(struct remote_info *ri)
-{
-  char req_uri[128];
-  struct evhttp_connection *evcon;
-  struct evhttp_request *req;
-  char *pairing_hash;
-  int ret;
-
-  pairing_hash = itunes_pairing_hash(ri->paircode, ri->pin);
-  if (!pairing_hash)
-    {
-      DPRINTF(E_LOG, L_REMOTE, "Could not compute pairing hash!\n");
-
-      goto hash_fail;
-    }
-
-  DPRINTF(E_DBG, L_REMOTE, "Pairing hash for %s/%s: %s\n", ri->pi.remote_id, ri->pi.name, pairing_hash);
-
-  /* Prepare request URI */
-  /* The servicename variable is the mDNS service group name; currently it's
-   * a hash of the library name, but in iTunes the service name and the library
-   * ID (DbId) are different (see comment in main.c).
-   * Remote uses the service name to perform mDNS lookups.
-   */
-  ret = snprintf(req_uri, sizeof(req_uri), "/pair?pairingcode=%s&servicename=%016" PRIX64, pairing_hash, libhash);
-  free(pairing_hash);
-  if ((ret < 0) || (ret >= sizeof(req_uri)))
-    {
-      DPRINTF(E_WARN, L_REMOTE, "Request URI for pairing exceeds buffer size\n");
-
-      goto req_uri_fail;
-    }
-
-  /* Fire up the request */
-  evcon = evhttp_connection_new(ri->address, ri->port);
-  if (!evcon)
-    {
-      DPRINTF(E_WARN, L_REMOTE, "Could not create connection for pairing\n");
-
-      goto evcon_fail;
-    }
-
-  evhttp_connection_set_base(evcon, evbase_main);
-
-  req = evhttp_request_new(pairing_request_cb, ri);
-  if (!req)
-    {
-      DPRINTF(E_WARN, L_REMOTE, "Could not create HTTP request for pairing\n");
-
-      goto request_fail;
-    }
-
-  ret = evhttp_make_request(evcon, req, EVHTTP_REQ_GET, req_uri);
-  if (ret < 0)
-    {
-      DPRINTF(E_WARN, L_REMOTE, "Could not make pairing request\n");
-
-      goto make_request_fail;
-    }
-
-  ri->evcon = evcon;
-
-  return;
-
- make_request_fail:
-  evhttp_request_free(req);
-
- request_fail:
-  evhttp_connection_free(evcon);
-
- evcon_fail:
- req_uri_fail:
- hash_fail:
-  free_remote(ri);
-}
-
-
-/* Thread: main (pairing) */
-static void
-pairing_cb(int fd, short event, void *arg)
-{
-  struct remote_info *ri;
-
-#ifdef USE_EVENTFD
-  eventfd_t count;
-  int ret;
-
-  ret = eventfd_read(pairing_efd, &count);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_REMOTE, "Could not read event counter: %s\n", strerror(errno));
-      return;
-    }
-#else
-  int dummy;
-
-  /* Drain the pipe */
-  while (read(pairing_pipe[0], &dummy, sizeof(dummy)) >= 0)
-    ; /* EMPTY */
-#endif
-
-  for (;;)
-    {
-      pthread_mutex_lock(&remote_lck);
-
-      for (ri = remote_list; ri; ri = ri->next)
-	{
-	  /* We've got both the mDNS data and the pin */
-	  if (ri->paircode && ri->pin)
-	    {
-	      unlink_remote(ri);
-	      break;
-	    }
-	}
-
-      pthread_mutex_unlock(&remote_lck);
-
-      if (!ri)
-	break;
-
-      do_pairing(ri);
-    }
-
-  event_add(&pairingev, NULL);
-}
-
-
 /* Thread: main */
 int
 remote_pairing_init(void)
 {
-  char *libname;
   int ret;
 
   remote_list = NULL;
@@ -819,9 +906,6 @@ remote_pairing_init(void)
 
       goto mdns_browse_fail;
     }
-
-  libname = cfg_getstr(cfg_getsec(cfg, "library"), "name");
-  libhash = murmur_hash64(libname, strlen(libname), 0);
 
 #ifdef USE_EVENTFD
   event_set(&pairingev, pairing_efd, EV_READ, pairing_cb, NULL);

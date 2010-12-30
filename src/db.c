@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2009-2010 Julien BLACHE <jb@jblache.org>
+ * Copyright (C) 2010 Kai Elwert <elwertk@googlemail.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -26,6 +27,7 @@
 #include <time.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <errno.h>
 
 #include <assert.h>
 
@@ -48,6 +50,12 @@
 
 enum group_type {
   G_ALBUMS = 1,
+};
+
+struct db_unlock {
+  int proceed;
+  pthread_cond_t cond;
+  pthread_mutex_t lck;
 };
 
 #define DB_TYPE_CHAR    1
@@ -236,6 +244,16 @@ static const struct col_type_map wi_cols_map[] =
     { wi_offsetof(path),   DB_TYPE_STRING },
   };
 
+/* Sort clauses */
+/* Keep in sync with enum sort_type */
+static const char *sort_clause[] =
+  {
+    "",
+    "ORDER BY title COLLATE DAAP ASC",
+    "ORDER BY album COLLATE DAAP ASC, disc ASC, track ASC",
+    "ORDER BY artist COLLATE DAAP ASC",
+  };
+
 static char *db_path;
 static __thread sqlite3 *hdl;
 
@@ -352,6 +370,40 @@ free_mfi(struct media_file_info *mfi, int content_only)
 }
 
 void
+unicode_fixup_mfi(struct media_file_info *mfi)
+{
+  char *ret;
+  char **field;
+  int i;
+
+  for (i = 0; i < (sizeof(mfi_cols_map) / sizeof(mfi_cols_map[0])); i++)
+    {
+      if (mfi_cols_map[i].type != DB_TYPE_STRING)
+	continue;
+
+      switch (mfi_cols_map[i].offset)
+	{
+	  case mfi_offsetof(path):
+	  case mfi_offsetof(fname):
+	  case mfi_offsetof(codectype):
+	    continue;
+	}
+
+      field = (char **) ((char *)mfi + mfi_cols_map[i].offset);
+
+      if (!*field)
+	continue;
+
+      ret = unicode_fixup_string(*field);
+      if (ret != *field)
+	{
+	  free(*field);
+	  *field = ret;
+	}
+    }
+}
+
+void
 free_pli(struct playlist_info *pli, int content_only)
 {
   if (pli->title)
@@ -366,6 +418,126 @@ free_pli(struct playlist_info *pli, int content_only)
   if (!content_only)
     free(pli);
 }
+
+
+/* Unlock notification support */
+static void
+unlock_notify_cb(void **args, int nargs)
+{
+  struct db_unlock *u;
+  int i;
+
+  for (i = 0; i < nargs; i++)
+    {
+      u = (struct db_unlock *)args[i];
+
+      pthread_mutex_lock(&u->lck);
+
+      u->proceed = 1;
+      pthread_cond_signal(&u->cond);
+
+      pthread_mutex_unlock(&u->lck);
+    }
+}
+
+static int
+db_wait_unlock(void)
+{
+  struct db_unlock u;
+  int ret;
+
+  u.proceed = 0;
+  pthread_mutex_init(&u.lck, NULL);
+  pthread_cond_init(&u.cond, NULL);
+
+  ret = sqlite3_unlock_notify(hdl, unlock_notify_cb, &u);
+  if (ret == SQLITE_OK)
+    {
+      pthread_mutex_lock(&u.lck);
+
+      if (!u.proceed)
+	pthread_cond_wait(&u.cond, &u.lck);
+
+      pthread_mutex_unlock(&u.lck);
+    }
+
+  pthread_cond_destroy(&u.cond);
+  pthread_mutex_destroy(&u.lck);
+
+  return ret;
+}
+
+static int
+db_blocking_step(sqlite3_stmt *stmt)
+{
+  int ret;
+
+  while ((ret = sqlite3_step(stmt)) == SQLITE_LOCKED)
+    {
+      ret = db_wait_unlock();
+      if (ret != SQLITE_OK)
+	{
+	  DPRINTF(E_LOG, L_DB, "Database deadlocked!\n");
+	  break;
+	}
+
+      sqlite3_reset(stmt);
+    }
+
+  return ret;
+}
+
+static int
+db_blocking_prepare_v2(const char *query, int len, sqlite3_stmt **stmt, const char **end)
+{
+  int ret;
+
+  while ((ret = sqlite3_prepare_v2(hdl, query, len, stmt, end)) == SQLITE_LOCKED)
+    {
+      ret = db_wait_unlock();
+      if (ret != SQLITE_OK)
+	{
+	  DPRINTF(E_LOG, L_DB, "Database deadlocked!\n");
+	  break;
+	}
+    }
+
+  return ret;
+}
+
+
+/* Modelled after sqlite3_exec() */
+static int
+db_exec(const char *query, char **errmsg)
+{
+  sqlite3_stmt *stmt;
+  int ret;
+
+  *errmsg = NULL;
+
+  ret = db_blocking_prepare_v2(query, -1, &stmt, NULL);
+  if (ret != SQLITE_OK)
+    {
+      *errmsg = sqlite3_mprintf("%s", sqlite3_errmsg(hdl));
+      return ret;
+    }
+
+  while ((ret = db_blocking_step(stmt)) == SQLITE_ROW)
+    ; /* EMPTY */
+
+  if (ret != SQLITE_DONE)
+    {
+      *errmsg = sqlite3_mprintf("%s", sqlite3_errmsg(hdl));
+
+      sqlite3_finalize(stmt);
+      return ret;
+    }
+
+  sqlite3_finalize(stmt);
+
+  return SQLITE_OK;
+}
+
 
 void
 db_purge_cruft(time_t ref)
@@ -401,7 +573,7 @@ db_purge_cruft(time_t ref)
     {
       DPRINTF(E_DBG, L_DB, "Running purge query '%s'\n", queries[i]);
 
-      ret = sqlite3_exec(hdl, queries[i], NULL, NULL, &errmsg);
+      ret = db_exec(queries[i], &errmsg);
       if (ret != SQLITE_OK)
 	{
 	  DPRINTF(E_LOG, L_DB, "Purge query %d error: %s\n", i, errmsg);
@@ -428,14 +600,14 @@ db_get_count(char *query)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  ret = sqlite3_prepare_v2(hdl, query, -1, &stmt, NULL);
+  ret = db_blocking_prepare_v2(query, -1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
       return -1;
     }
 
-  ret = sqlite3_step(stmt);
+  ret = db_blocking_step(stmt);
   if (ret != SQLITE_ROW)
     {
       DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));	
@@ -498,6 +670,7 @@ db_build_query_items(struct query_params *qp, char **q)
   char *query;
   char *count;
   char *idx;
+  const char *sort;
   int ret;
 
   if (qp->filter)
@@ -523,14 +696,16 @@ db_build_query_items(struct query_params *qp, char **q)
   if (ret < 0)
     return -1;
 
+  sort = sort_clause[qp->sort];
+
   if (idx && qp->filter)
-    query = sqlite3_mprintf("SELECT * FROM files WHERE disabled = 0 AND %s %s;", qp->filter, idx);
+    query = sqlite3_mprintf("SELECT * FROM files WHERE disabled = 0 AND %s %s %s;", qp->filter, sort, idx);
   else if (idx)
-    query = sqlite3_mprintf("SELECT * FROM files WHERE disabled = 0 %s;", idx);
+    query = sqlite3_mprintf("SELECT * FROM files WHERE disabled = 0 %s %s;", sort, idx);
   else if (qp->filter)
-    query = sqlite3_mprintf("SELECT * FROM files WHERE disabled = 0 AND %s;", qp->filter);
+    query = sqlite3_mprintf("SELECT * FROM files WHERE disabled = 0 AND %s %s;", qp->filter, sort);
   else
-    query = sqlite3_mprintf("SELECT * FROM files WHERE disabled = 0;");
+    query = sqlite3_mprintf("SELECT * FROM files WHERE disabled = 0 %s;", sort);
 
   if (!query)
     {
@@ -647,6 +822,7 @@ db_build_query_plitems_smart(struct query_params *qp, char *smartpl_query, char 
   char *count;
   char *filter;
   char *idx;
+  const char *sort;
   int ret;
 
   if (qp->filter)
@@ -676,7 +852,9 @@ db_build_query_plitems_smart(struct query_params *qp, char *smartpl_query, char 
   if (!idx)
     idx = "";
 
-  query = sqlite3_mprintf("SELECT * FROM files WHERE disabled = 0 AND %s AND %s %s;", smartpl_query, filter, idx);
+  sort = sort_clause[qp->sort];
+
+  query = sqlite3_mprintf("SELECT * FROM files WHERE disabled = 0 AND %s AND %s %s %s;", smartpl_query, filter, sort, idx);
   if (!query)
     {
       DPRINTF(E_LOG, L_DB, "Out of memory for query string\n");
@@ -742,13 +920,13 @@ db_build_query_groups(struct query_params *qp, char **q)
     return -1;
 
   if (idx && qp->filter)
-    query = sqlite3_mprintf("SELECT COUNT(*), g.id, g.persistentid, f.album_artist, g.name FROM files f JOIN groups g ON f.songalbumid = g.persistentid GROUP BY f.album_artist, g.name HAVING g.type = %d AND disabled = 0 AND %s %s;", G_ALBUMS, qp->filter, idx);
+    query = sqlite3_mprintf("SELECT COUNT(*), g.id, g.persistentid, f.album_artist, g.name FROM files f JOIN groups g ON f.songalbumid = g.persistentid GROUP BY f.album COLLATE DAAP, g.name HAVING g.type = %d AND disabled = 0 AND %s %s;", G_ALBUMS, qp->filter, idx);
   else if (idx)
-    query = sqlite3_mprintf("SELECT COUNT(*), g.id, g.persistentid, f.album_artist, g.name FROM files f JOIN groups g ON f.songalbumid = g.persistentid GROUP BY f.album_artist, g.name HAVING g.type = %d AND disabled = 0 %s;", G_ALBUMS, idx);
+    query = sqlite3_mprintf("SELECT COUNT(*), g.id, g.persistentid, f.album_artist, g.name FROM files f JOIN groups g ON f.songalbumid = g.persistentid GROUP BY f.album COLLATE DAAP, g.name HAVING g.type = %d AND disabled = 0 %s;", G_ALBUMS, idx);
   else if (qp->filter)
-    query = sqlite3_mprintf("SELECT COUNT(*), g.id, g.persistentid, f.album_artist, g.name FROM files f JOIN groups g ON f.songalbumid = g.persistentid GROUP BY f.album_artist, g.name HAVING g.type = %d AND disabled = 0 AND %s;", G_ALBUMS, qp->filter);
+    query = sqlite3_mprintf("SELECT COUNT(*), g.id, g.persistentid, f.album_artist, g.name FROM files f JOIN groups g ON f.songalbumid = g.persistentid GROUP BY f.album COLLATE DAAP, g.name HAVING g.type = %d AND disabled = 0 AND %s;", G_ALBUMS, qp->filter);
   else
-    query = sqlite3_mprintf("SELECT COUNT(*), g.id, g.persistentid, f.album_artist, g.name FROM files f JOIN groups g ON f.songalbumid = g.persistentid GROUP BY f.album_artist, g.name HAVING g.type = %d AND disabled = 0;", G_ALBUMS);
+    query = sqlite3_mprintf("SELECT COUNT(*), g.id, g.persistentid, f.album_artist, g.name FROM files f JOIN groups g ON f.songalbumid = g.persistentid GROUP BY f.album COLLATE DAAP, g.name HAVING g.type = %d AND disabled = 0;", G_ALBUMS);
 
   if (!query)
     {
@@ -878,10 +1056,10 @@ db_build_query_browse(struct query_params *qp, char *field, char **q)
   int ret;
 
   if (qp->filter)
-    count = sqlite3_mprintf("SELECT COUNT(DISTINCT %s) FROM files WHERE data_kind = 0 AND disabled = 0 AND %s != '' AND %s;",
+    count = sqlite3_mprintf("SELECT COUNT(DISTINCT %s COLLATE DAAP) FROM files WHERE data_kind = 0 AND disabled = 0 AND %s != '' AND %s;",
 			    field, field, qp->filter);
   else
-    count = sqlite3_mprintf("SELECT COUNT(DISTINCT %s) FROM files WHERE data_kind = 0 AND disabled = 0 AND %s != '';",
+    count = sqlite3_mprintf("SELECT COUNT(DISTINCT %s COLLATE DAAP) FROM files WHERE data_kind = 0 AND disabled = 0 AND %s != '';",
 			    field, field);
 
   if (!count)
@@ -903,16 +1081,16 @@ db_build_query_browse(struct query_params *qp, char *field, char **q)
     return -1;
 
   if (idx && qp->filter)
-    query = sqlite3_mprintf("SELECT DISTINCT %s FROM files WHERE data_kind = 0 AND disabled = 0 AND %s != ''"
+    query = sqlite3_mprintf("SELECT DISTINCT %s COLLATE DAAP FROM files WHERE data_kind = 0 AND disabled = 0 AND %s != ''"
 			    " AND %s %s;", field, field, qp->filter, idx);
   else if (idx)
-    query = sqlite3_mprintf("SELECT DISTINCT %s FROM files WHERE data_kind = 0 AND disabled = 0 AND %s != ''"
+    query = sqlite3_mprintf("SELECT DISTINCT %s COLLATE DAAP FROM files WHERE data_kind = 0 AND disabled = 0 AND %s != ''"
 			    " %s;", field, field, idx);
   else if (qp->filter)
-    query = sqlite3_mprintf("SELECT DISTINCT %s FROM files WHERE data_kind = 0 AND disabled = 0 AND %s != ''"
+    query = sqlite3_mprintf("SELECT DISTINCT %s COLLATE DAAP FROM files WHERE data_kind = 0 AND disabled = 0 AND %s != ''"
 			    " AND %s;", field, field, qp->filter);
   else
-    query = sqlite3_mprintf("SELECT DISTINCT %s FROM files WHERE data_kind = 0 AND disabled = 0 AND %s != ''",
+    query = sqlite3_mprintf("SELECT DISTINCT %s COLLATE DAAP FROM files WHERE data_kind = 0 AND disabled = 0 AND %s != ''",
 			    field, field);
 
   if (!query)
@@ -986,7 +1164,7 @@ db_query_start(struct query_params *qp)
 
   DPRINTF(E_DBG, L_DB, "Starting query '%s'\n", query);
 
-  ret = sqlite3_prepare_v2(hdl, query, -1, &qp->stmt, NULL);
+  ret = db_blocking_prepare_v2(query, -1, &qp->stmt, NULL);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
@@ -1034,7 +1212,7 @@ db_query_fetch_file(struct query_params *qp, struct db_media_file_info *dbmfi)
       return -1;
     }
 
-  ret = sqlite3_step(qp->stmt);
+  ret = db_blocking_step(qp->stmt);
   if (ret == SQLITE_DONE)
     {
       DPRINTF(E_INFO, L_DB, "End of query results\n");
@@ -1090,7 +1268,7 @@ db_query_fetch_pl(struct query_params *qp, struct db_playlist_info *dbpli)
       return -1;
     }
 
-  ret = sqlite3_step(qp->stmt);
+  ret = db_blocking_step(qp->stmt);
   if (ret == SQLITE_DONE)
     {
       DPRINTF(E_INFO, L_DB, "End of query results\n");
@@ -1170,7 +1348,7 @@ db_query_fetch_group(struct query_params *qp, struct db_group_info *dbgri)
       return -1;
     }
 
-  ret = sqlite3_step(qp->stmt);
+  ret = db_blocking_step(qp->stmt);
   if (ret == SQLITE_DONE)
     {
       DPRINTF(E_INFO, L_DB, "End of query results\n");
@@ -1219,7 +1397,7 @@ db_query_fetch_string(struct query_params *qp, char **string)
       return -1;
     }
 
-  ret = sqlite3_step(qp->stmt);
+  ret = db_blocking_step(qp->stmt);
   if (ret == SQLITE_DONE)
     {
       DPRINTF(E_INFO, L_DB, "End of query results\n");
@@ -1254,8 +1432,7 @@ db_files_update_songalbumid(void)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", Q_SONGALBUMID);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, Q_SONGALBUMID, NULL, NULL, &errmsg);
+  ret = db_exec(Q_SONGALBUMID, &errmsg);
   if (ret != SQLITE_OK)
     DPRINTF(E_LOG, L_DB, "Error updating songalbumid: %s\n", errmsg);
 
@@ -1282,8 +1459,7 @@ db_file_inc_playcount(int id)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     DPRINTF(E_LOG, L_DB, "Error incrementing play count on %d: %s\n", id, errmsg);
 
@@ -1311,8 +1487,7 @@ db_file_ping(char *path)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     DPRINTF(E_LOG, L_DB, "Error pinging file '%s': %s\n", path, errmsg);
 
@@ -1341,7 +1516,7 @@ db_file_path_byid(int id)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  ret = sqlite3_prepare_v2(hdl, query, strlen(query) + 1, &stmt, NULL);
+  ret = db_blocking_prepare_v2(query, strlen(query) + 1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
@@ -1350,7 +1525,7 @@ db_file_path_byid(int id)
       return NULL;
     }
 
-  ret = sqlite3_step(stmt);
+  ret = db_blocking_step(stmt);
   if (ret != SQLITE_ROW)
     {
       if (ret == SQLITE_DONE)
@@ -1386,7 +1561,7 @@ db_file_id_byquery(char *query)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  ret = sqlite3_prepare_v2(hdl, query, strlen(query) + 1, &stmt, NULL);
+  ret = db_blocking_prepare_v2(query, strlen(query) + 1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
@@ -1394,7 +1569,7 @@ db_file_id_byquery(char *query)
       return 0;
     }
 
-  ret = sqlite3_step(stmt);
+  ret = db_blocking_step(stmt);
   if (ret != SQLITE_ROW)
     {
       if (ret == SQLITE_DONE)
@@ -1528,7 +1703,7 @@ db_file_stamp_bypath(char *path)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  ret = sqlite3_prepare_v2(hdl, query, strlen(query) + 1, &stmt, NULL);
+  ret = db_blocking_prepare_v2(query, strlen(query) + 1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
@@ -1537,7 +1712,7 @@ db_file_stamp_bypath(char *path)
       return 0;
     }
 
-  ret = sqlite3_step(stmt);
+  ret = db_blocking_step(stmt);
   if (ret != SQLITE_ROW)
     {
       if (ret == SQLITE_DONE)
@@ -1587,7 +1762,7 @@ db_file_fetch_byquery(char *query)
     }
   memset(mfi, 0, sizeof(struct media_file_info));
 
-  ret = sqlite3_prepare_v2(hdl, query, -1, &stmt, NULL);
+  ret = db_blocking_prepare_v2(query, -1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
@@ -1596,7 +1771,7 @@ db_file_fetch_byquery(char *query)
       return NULL;
     }
 
-  ret = sqlite3_step(stmt);
+  ret = db_blocking_step(stmt);
 
   if (ret != SQLITE_ROW)
     {
@@ -1719,7 +1894,7 @@ db_file_add(struct media_file_info *mfi)
 
   if (mfi->id != 0)
     {
-      DPRINTF(E_WARN, L_DB, "Trying to update file with id > 0; use db_file_update()?\n");
+      DPRINTF(E_WARN, L_DB, "Trying to add file with non-zero id; use db_file_update()?\n");
       return -1;
     }
 
@@ -1753,8 +1928,7 @@ db_file_add(struct media_file_info *mfi)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Query error: %s\n", errmsg);
@@ -1780,7 +1954,7 @@ db_file_update(struct media_file_info *mfi)
                " year = %d, track = %d, total_tracks = %d, disc = %d, total_discs = %d, bpm = %d," \
                " compilation = %d, rating = %d, data_kind = %d, item_kind = %d," \
                " description = %Q, time_modified = %" PRIi64 "," \
-               " db_timestamp = %" PRIi64 ", sample_count = %d," \
+               " db_timestamp = %" PRIi64 ", sample_count = %" PRIi64 "," \
                " codectype = %Q, idx = %d, has_video = %d," \
                " bits_per_sample = %d, album_artist = %Q," \
                " media_kind = %d, tv_series_name = %Q, tv_episode_num_str = %Q," \
@@ -1827,8 +2001,7 @@ db_file_update(struct media_file_info *mfi)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Query error: %s\n", errmsg);
@@ -1863,8 +2036,7 @@ db_file_delete_bypath(char *path)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     DPRINTF(E_LOG, L_DB, "Error deleting file: %s\n", errmsg);
 
@@ -1882,8 +2054,7 @@ db_file_disable_byquery(char *query)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     DPRINTF(E_LOG, L_DB, "Error disabling file: %s\n", errmsg);
 
@@ -1960,8 +2131,7 @@ db_file_enable_bycookie(uint32_t cookie, char *path)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Error enabling files: %s\n", errmsg);
@@ -2053,8 +2223,7 @@ db_pl_ping(int id)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     DPRINTF(E_LOG, L_DB, "Error pinging playlist %d: %s\n", id, errmsg);
 
@@ -2082,7 +2251,7 @@ db_pl_id_bypath(char *path, int *id)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  ret = sqlite3_prepare_v2(hdl, query, -1, &stmt, NULL);
+  ret = db_blocking_prepare_v2(query, -1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
@@ -2091,7 +2260,7 @@ db_pl_id_bypath(char *path, int *id)
       return -1;
     }
 
-  ret = sqlite3_step(stmt);
+  ret = db_blocking_step(stmt);
   if (ret != SQLITE_ROW)
     {
       if (ret == SQLITE_DONE)
@@ -2140,7 +2309,7 @@ db_pl_fetch_byquery(char *query)
     }
   memset(pli, 0, sizeof(struct playlist_info));
 
-  ret = sqlite3_prepare_v2(hdl, query, -1, &stmt, NULL);
+  ret = db_blocking_prepare_v2(query, -1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
@@ -2149,7 +2318,7 @@ db_pl_fetch_byquery(char *query)
       return NULL;
     }
 
-  ret = sqlite3_step(stmt);
+  ret = db_blocking_step(stmt);
   if (ret != SQLITE_ROW)
     {
       if (ret == SQLITE_DONE)
@@ -2207,7 +2376,7 @@ db_pl_fetch_byquery(char *query)
 	}
     }
 
-  ret = sqlite3_step(stmt);
+  ret = db_blocking_step(stmt);
   sqlite3_finalize(stmt);
 
   if (ret != SQLITE_DONE)
@@ -2348,8 +2517,7 @@ db_pl_add(char *title, char *path, int *id)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Query error: %s\n", errmsg);
@@ -2393,8 +2561,7 @@ db_pl_add_item_bypath(int plid, char *path)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Query error: %s\n", errmsg);
@@ -2428,8 +2595,7 @@ db_pl_add_item_byid(int plid, int fileid)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Query error: %s\n", errmsg);
@@ -2464,8 +2630,7 @@ db_pl_clear_items(int id)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     DPRINTF(E_LOG, L_DB, "Error clearing playlist %d items: %s\n", id, errmsg);
 
@@ -2496,8 +2661,7 @@ db_pl_delete(int id)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     DPRINTF(E_LOG, L_DB, "Error deleting playlist %d: %s\n", id, errmsg);
 
@@ -2530,8 +2694,7 @@ db_pl_disable_byquery(char *query)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     DPRINTF(E_LOG, L_DB, "Error disabling playlist: %s\n", errmsg);
 
@@ -2608,8 +2771,7 @@ db_pl_enable_bycookie(uint32_t cookie, char *path)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Error enabling playlists: %s\n", errmsg);
@@ -2637,8 +2799,7 @@ db_groups_clear(void)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Query error: %s\n", errmsg);
@@ -2668,7 +2829,7 @@ db_group_type_byid(int id)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  ret = sqlite3_prepare_v2(hdl, query, strlen(query) + 1, &stmt, NULL);
+  ret = db_blocking_prepare_v2(query, strlen(query) + 1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
@@ -2677,7 +2838,7 @@ db_group_type_byid(int id)
       return 0;
     }
 
-  ret = sqlite3_step(stmt);
+  ret = db_blocking_step(stmt);
   if (ret != SQLITE_ROW)
     {
       if (ret == SQLITE_DONE)
@@ -2719,8 +2880,7 @@ db_pairing_delete_byremote(char *remote_id)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Error deleting pairing: %s\n", errmsg);
@@ -2759,8 +2919,7 @@ db_pairing_add(struct pairing_info *pi)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Error adding pairing: %s\n", errmsg);
@@ -2794,14 +2953,14 @@ db_pairing_fetch_byguid(struct pairing_info *pi)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  ret = sqlite3_prepare_v2(hdl, query, -1, &stmt, NULL);
+  ret = db_blocking_prepare_v2(query, -1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
       return -1;
     }
 
-  ret = sqlite3_step(stmt);
+  ret = db_blocking_step(stmt);
   if (ret != SQLITE_ROW)
     {
       if (ret == SQLITE_DONE)
@@ -2826,6 +2985,115 @@ db_pairing_fetch_byguid(struct pairing_info *pi)
 }
 
 
+/* Speakers */
+int
+db_speaker_save(uint64_t id, int selected, int volume)
+{
+#define Q_TMPL "INSERT OR REPLACE INTO speakers (id, selected, volume) VALUES (%" PRIi64 ", %d, %d);"
+  char *query;
+  char *errmsg;
+  int ret;
+
+  query = sqlite3_mprintf(Q_TMPL, id, selected, volume);
+  if (!query)
+    {
+      DPRINTF(E_LOG, L_DB, "Out of memory for query string\n");
+
+      return -1;
+    }
+
+  DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
+
+  errmsg = NULL;
+  ret = db_exec(query, &errmsg);
+  if (ret != SQLITE_OK)
+    {
+      DPRINTF(E_LOG, L_DB, "Error saving speaker state: %s\n", errmsg);
+
+      sqlite3_free(errmsg);
+      sqlite3_free(query);
+      return -1;
+    }
+
+  sqlite3_free(query);
+
+  return 0;
+
+#undef Q_TMPL
+}
+
+int
+db_speaker_get(uint64_t id, int *selected, int *volume)
+{
+#define Q_TMPL "SELECT selected, volume FROM speakers WHERE id = %" PRIi64 ";"
+  sqlite3_stmt *stmt;
+  char *query;
+  int ret;
+
+  query = sqlite3_mprintf(Q_TMPL, id);
+  if (!query)
+    {
+      DPRINTF(E_LOG, L_DB, "Out of memory for query string\n");
+
+      return -1;
+    }
+
+  DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
+
+  ret = db_blocking_prepare_v2(query, -1, &stmt, NULL);
+  if (ret != SQLITE_OK)
+    {
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+
+      ret = -1;
+      goto out;
+    }
+
+  ret = db_blocking_step(stmt);
+  if (ret != SQLITE_ROW)
+    {
+      if (ret != SQLITE_DONE)
+	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));
+
+      sqlite3_finalize(stmt);
+
+      ret = -1;
+      goto out;
+    }
+
+  *selected = sqlite3_column_int(stmt, 0);
+  *volume = sqlite3_column_int(stmt, 1);
+
+  sqlite3_finalize(stmt);
+
+  ret = 0;
+
+ out:
+  sqlite3_free(query);
+  return ret;
+
+#undef Q_TMPL
+}
+
+void
+db_speaker_clear_all(void)
+{
+  char *query = "UPDATE speakers SET selected = 0;";
+  char *errmsg;
+  int ret;
+
+  DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
+
+  ret = db_exec(query, &errmsg);
+  if (ret != SQLITE_OK)
+    {
+      DPRINTF(E_LOG, L_DB, "Query error: %s\n", errmsg);
+
+      sqlite3_free(errmsg);
+    }
+}
+
+
 /* Inotify */
 int
 db_watch_clear(void)
@@ -2836,8 +3104,7 @@ db_watch_clear(void)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Query error: %s\n", errmsg);
@@ -2867,8 +3134,7 @@ db_watch_add(struct watch_info *wi)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Error adding watch: %s\n", errmsg);
@@ -2893,8 +3159,7 @@ db_watch_delete_byquery(char *query)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Error deleting watch: %s\n", errmsg);
@@ -3029,14 +3294,14 @@ db_watch_get_bywd(struct watch_info *wi)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  ret = sqlite3_prepare_v2(hdl, query, -1, &stmt, NULL);
+  ret = db_blocking_prepare_v2(query, -1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
       return -1;
     }
 
-  ret = sqlite3_step(stmt);
+  ret = db_blocking_step(stmt);
   if (ret != SQLITE_ROW)
     {
       DPRINTF(E_LOG, L_DB, "Watch wd %d not found\n", wi->wd);
@@ -3105,8 +3370,7 @@ db_watch_mark_byquery(char *query)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     DPRINTF(E_LOG, L_DB, "Error marking watch: %s\n", errmsg);
 
@@ -3186,8 +3450,7 @@ db_watch_move_bycookie(uint32_t cookie, char *path)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  errmsg = NULL;
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = db_exec(query, &errmsg);
   if (ret != SQLITE_OK)
     DPRINTF(E_LOG, L_DB, "Error moving watch: %s\n", errmsg);
 
@@ -3253,7 +3516,7 @@ db_watch_enum_start(struct watch_enum *we)
 
   DPRINTF(E_DBG, L_DB, "Starting enum '%s'\n", query);
 
-  ret = sqlite3_prepare_v2(hdl, query, -1, &we->stmt, NULL);
+  ret = db_blocking_prepare_v2(query, -1, &we->stmt, NULL);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
@@ -3293,7 +3556,7 @@ db_watch_enum_fetchwd(struct watch_enum *we, uint32_t *wd)
       return -1;
     }
 
-  ret = sqlite3_step(we->stmt);
+  ret = db_blocking_step(we->stmt);
   if (ret == SQLITE_DONE)
     {
       DPRINTF(E_INFO, L_DB, "End of watch enum results\n");
@@ -3311,49 +3574,20 @@ db_watch_enum_fetchwd(struct watch_enum *we, uint32_t *wd)
 }
 
 
+#ifdef DB_PROFILE
 static void
-db_daap_songalbumid_xfunc(sqlite3_context *pv, int n, sqlite3_value **ppv)
+db_xprofile(void *notused, const char *pquery, sqlite3_uint64 ptime)
 {
-  const char *album_artist;
-  const char *album;
-  char *hashbuf;
-  sqlite3_int64 result;
-
-  if (n != 2)
-    {
-      sqlite3_result_error(pv, "daap_songalbumid() requires 2 parameters, album_artist and album", -1);
-      return;
-    }
-
-  if ((sqlite3_value_type(ppv[0]) != SQLITE_TEXT)
-      || (sqlite3_value_type(ppv[1]) != SQLITE_TEXT))
-    {
-      sqlite3_result_error(pv, "daap_songalbumid() requires 2 text parameters", -1);
-      return;
-    }
-
-  album_artist = (const char *)sqlite3_value_text(ppv[0]);
-  album = (const char *)sqlite3_value_text(ppv[1]);
-
-  hashbuf = sqlite3_mprintf("%s==%s", (album_artist) ? album_artist : "", (album) ? album : "");
-  if (!hashbuf)
-    {
-      sqlite3_result_error(pv, "daap_songalbumid() out of memory for hashbuf", -1);
-      return;
-    }
-
-  /* Limit hash length to 63 bits, due to signed type in sqlite */
-  result = murmur_hash64(hashbuf, strlen(hashbuf), 0) >> 1;
-
-  sqlite3_free(hashbuf);
-
-  sqlite3_result_int64(pv, result);
+  DPRINTF(E_DBG, L_DB, "SQL PROFILE query: %s\n", pquery);
+  DPRINTF(E_DBG, L_DB, "SQL PROFILE time: %" PRIu64 "\n", (uint64_t)ptime); 
 }
+#endif
 
 
 int
 db_perthread_init(void)
 {
+  char *errmsg;
   int ret;
 
   ret = sqlite3_open(db_path, &hdl);
@@ -3365,14 +3599,43 @@ db_perthread_init(void)
       return -1;
     }
 
-  ret = sqlite3_create_function(hdl, "daap_songalbumid", 2, SQLITE_UTF8, NULL, db_daap_songalbumid_xfunc, NULL, NULL);
+  ret = sqlite3_enable_load_extension(hdl, 1);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not create daap_songalbumid function: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not enable extension loading\n");
 
       sqlite3_close(hdl);
       return -1;
     }
+
+  errmsg = NULL;
+  ret = sqlite3_load_extension(hdl, PKGLIBDIR "/forked-daapd-sqlext.so", NULL, &errmsg);
+  if (ret != SQLITE_OK)
+    {
+      if (errmsg)
+	{
+	  DPRINTF(E_LOG, L_DB, "Could not load SQLite extension: %s\n", errmsg);
+	  sqlite3_free(errmsg);
+	}
+      else
+	DPRINTF(E_LOG, L_DB, "Could not load SQLite extension: %s\n", sqlite3_errmsg(hdl));
+
+      sqlite3_close(hdl);
+      return -1;
+    }
+
+  ret = sqlite3_enable_load_extension(hdl, 0);
+  if (ret != SQLITE_OK)
+    {
+      DPRINTF(E_LOG, L_DB, "Could not disable extension loading\n");
+
+      sqlite3_close(hdl);
+      return -1;
+    }
+
+#ifdef DB_PROFILE
+  sqlite3_profile(hdl, db_xprofile, NULL);
+#endif
 
   return 0;
 }
@@ -3381,6 +3644,9 @@ void
 db_perthread_deinit(void)
 {
   sqlite3_stmt *stmt;
+
+  if (!hdl)
+    return;
 
   /* Tear down anything that's in flight */
   while ((stmt = sqlite3_next_stmt(hdl, 0)))
@@ -3485,6 +3751,13 @@ db_perthread_deinit(void)
   "   guid           VARCHAR(16) NOT NULL"		\
   ");"
 
+#define T_SPEAKERS					\
+  "CREATE TABLE IF NOT EXISTS speakers("		\
+  "   id             INTEGER PRIMARY KEY NOT NULL,"	\
+  "   selected       INTEGER NOT NULL,"			\
+  "   volume         INTEGER NOT NULL"			\
+  ");"
+
 #define T_INOTIFY					\
   "CREATE TABLE IF NOT EXISTS inotify ("		\
   "   wd          INTEGER PRIMARY KEY NOT NULL,"	\
@@ -3540,10 +3813,9 @@ db_perthread_deinit(void)
   " VALUES(8, 'Purchased', 0, 'media_kind = 1024', 0, '', 0, 8);"
  */
 
-
-#define SCHEMA_VERSION 9
+#define SCHEMA_VERSION 11
 #define Q_SCVER					\
-  "INSERT INTO admin (key, value) VALUES ('schema_version', '9');"
+  "INSERT INTO admin (key, value) VALUES ('schema_version', '11');"
 
 struct db_init_query {
   char *query;
@@ -3558,6 +3830,7 @@ static const struct db_init_query db_init_queries[] =
     { T_PLITEMS,   "create table playlistitems" },
     { T_GROUPS,    "create table groups" },
     { T_PAIRINGS,  "create table pairings" },
+    { T_SPEAKERS,  "create table speakers" },
     { T_INOTIFY,   "create table inotify" },
 
     { I_PATH,      "create file path index" },
@@ -3809,6 +4082,198 @@ static const struct db_init_query db_upgrade_v9_queries[] =
     { U_V9_SCVER,     "set schema_version to 9" },
   };
 
+/* Upgrade from schema v9 to v10 */
+
+#define U_V10_PLVOL				\
+  "INSERT INTO admin (key, value) VALUES ('player:volume', '75');"
+
+#define U_V10_SCVER					\
+  "UPDATE admin SET value = '10' WHERE key = 'schema_version';"
+
+static const struct db_init_query db_upgrade_v10_queries[] =
+  {
+    { U_V10_PLVOL,     "store player start volume" },
+    { U_V10_SCVER,     "set schema_version to 10" },
+  };
+
+/* Upgrade from schema v10 to v11 */
+
+#define U_V11_SPEAKERS					\
+  "CREATE TABLE speakers("				\
+  "   id             INTEGER PRIMARY KEY NOT NULL,"	\
+  "   selected       INTEGER NOT NULL,"			\
+  "   volume         INTEGER NOT NULL"			\
+  ");"
+
+#define U_V11_SCVER					\
+  "UPDATE admin SET value = '11' WHERE key = 'schema_version';"
+
+static const struct db_init_query db_upgrade_v11_queries[] =
+  {
+    { U_V11_SPEAKERS,  "create new table speakers" },
+    { U_V11_SCVER,     "set schema_version to 11" },
+  };
+
+static int
+db_upgrade_v11(void)
+{
+#define Q_NEWSPK "INSERT INTO speakers (id, selected, volume) VALUES (%" PRIi64 ", 1, 75);"
+#define Q_SPKVOL "UPDATE speakers SET volume = %d;"
+  sqlite3_stmt *stmt;
+  char *query;
+  char *errmsg;
+  const char *strid;
+  uint64_t *spkids;
+  int volume;
+  int count;
+  int i;
+  int qret;
+  int ret;
+
+  /* Get saved speakers */
+  count = db_get_count("SELECT COUNT(*) FROM admin WHERE key = 'player:active-spk';");
+  if (count == 0)
+    goto clear_vars;
+  else if (count < 0)
+    return -1;
+
+  spkids = (uint64_t *)malloc(count * sizeof(uint64_t));
+  if (!spkids)
+    {
+      DPRINTF(E_LOG, L_DB, "Out of memory for speaker IDs\n");
+
+      return -1;
+    }
+
+  query = "SELECT value FROM admin WHERE key = 'player:active-spk';";
+
+  DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
+
+  ret = sqlite3_prepare_v2(hdl, query, -1, &stmt, NULL);
+  if (ret != SQLITE_OK)
+    {
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+
+      goto out_free_ids;
+    }
+
+  i = 0;
+  ret = 0;
+  while ((qret = sqlite3_step(stmt)) == SQLITE_ROW)
+    {
+      strid = (const char *)sqlite3_column_text(stmt, 0);
+
+      ret = safe_hextou64(strid, spkids + i);
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_DB, "Could not convert speaker ID: %s\n", strid);
+	  break;
+	}
+
+      i++;
+    }
+
+  sqlite3_finalize(stmt);
+
+  if ((ret == 0) && (qret != SQLITE_DONE))
+    {
+      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));
+
+      goto out_free_ids;
+    }
+  else if (ret < 0)
+    goto out_free_ids;
+
+  /* Get saved volume */
+  query = "SELECT value FROM admin WHERE key = 'player:volume';";
+
+  DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
+
+  ret = sqlite3_prepare_v2(hdl, query, -1, &stmt, NULL);
+  if (ret != SQLITE_OK)
+    {
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+
+      goto out_free_ids;
+    }
+
+  ret = sqlite3_step(stmt);
+  if (ret != SQLITE_ROW)
+    {
+      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));
+
+      sqlite3_finalize(stmt);
+      goto out_free_ids;
+    }
+
+  volume = sqlite3_column_int(stmt, 0);
+
+  sqlite3_finalize(stmt);
+
+  /* Add speakers to the table */
+  for (i = 0; i < count; i++)
+    {
+      query = sqlite3_mprintf(Q_NEWSPK, spkids[i]);
+      if (!query)
+	{
+	  DPRINTF(E_LOG, L_DB, "Out of memory for query string\n");
+
+	  goto out_free_ids;
+	}
+
+      DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
+
+      ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+      if (ret != SQLITE_OK)
+	DPRINTF(E_LOG, L_DB, "Error adding speaker: %s\n", errmsg);
+
+      sqlite3_free(errmsg);
+      sqlite3_free(query);
+    }
+
+  free(spkids);
+
+  /* Update with volume */
+  query = sqlite3_mprintf(Q_SPKVOL, volume);
+  if (!query)
+    {
+      DPRINTF(E_LOG, L_DB, "Out of memory for query string\n");
+
+      return -1;
+    }
+
+  DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
+
+  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  if (ret != SQLITE_OK)
+    DPRINTF(E_LOG, L_DB, "Error adding speaker: %s\n", errmsg);
+
+  sqlite3_free(errmsg);
+  sqlite3_free(query);
+
+  /* Clear old config keys */
+ clear_vars:
+  query = "DELETE FROM admin WHERE key = 'player:volume' OR key = 'player:active-spk';";
+
+  DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
+
+  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  if (ret != SQLITE_OK)
+    DPRINTF(E_LOG, L_DB, "Error adding speaker: %s\n", errmsg);
+
+  sqlite3_free(errmsg);
+
+  return 0;
+
+ out_free_ids:
+  free(spkids);
+
+  return -1;
+
+#undef Q_NEWSPK
+#undef Q_SPKVOL
+}
+
 static int
 db_check_version(void)
 {
@@ -3824,14 +4289,14 @@ db_check_version(void)
   ret = sqlite3_prepare_v2(hdl, Q_VER, strlen(Q_VER) + 1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s %d\n", sqlite3_errmsg(hdl), ret);
-      return -1;
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      return 1;
     }
 
   ret = sqlite3_step(stmt);
   if (ret != SQLITE_ROW)
     {
-      DPRINTF(E_LOG, L_DB, "Could not step: %s %d\n", sqlite3_errmsg(hdl), ret);
+      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));
 
       sqlite3_finalize(stmt);
       return -1;
@@ -3901,6 +4366,24 @@ db_check_version(void)
 	    if (ret < 0)
 	      return -1;
 
+	    /* FALLTHROUGH */
+
+	  case 9:
+	    ret = db_generic_upgrade(db_upgrade_v10_queries, sizeof(db_upgrade_v10_queries) / sizeof(db_upgrade_v10_queries[0]));
+	    if (ret < 0)
+	      return -1;
+
+	    /* FALLTHROUGH */
+
+	  case 10:
+	    ret = db_generic_upgrade(db_upgrade_v11_queries, sizeof(db_upgrade_v11_queries) / sizeof(db_upgrade_v11_queries[0]));
+	    if (ret < 0)
+	      return -1;
+
+	    ret = db_upgrade_v11();
+	    if (ret < 0)
+	      return -1;
+
 	    break;
 
 	  default:
@@ -3941,9 +4424,25 @@ db_init(void)
 
   db_path = cfg_getstr(cfg_getsec(cfg, "general"), "db_path");
 
-  if (!sqlite3_threadsafe())
+  ret = sqlite3_config(SQLITE_CONFIG_MULTITHREAD);
+  if (ret != SQLITE_OK)
     {
-      DPRINTF(E_FATAL, L_DB, "The SQLite3 library is not built with a threadsafe configuration\n");
+      DPRINTF(E_FATAL, L_DB, "Could not switch SQLite3 to multithread mode\n");
+      DPRINTF(E_FATAL, L_DB, "Check that SQLite3 has been configured for thread-safe operations\n");
+      return -1;
+    }
+
+  ret = sqlite3_enable_shared_cache(1);
+  if (ret != SQLITE_OK)
+    {
+      DPRINTF(E_FATAL, L_DB, "Could not enable SQLite3 shared-cache mode\n");
+      return -1;
+    }
+
+  ret = sqlite3_initialize();
+  if (ret != SQLITE_OK)
+    {
+      DPRINTF(E_FATAL, L_DB, "SQLite3 failed to initialize\n");
       return -1;
     }
 
@@ -3953,6 +4452,13 @@ db_init(void)
 
   ret = db_check_version();
   if (ret < 0)
+    {
+      DPRINTF(E_FATAL, L_DB, "Database version check errored out, incompatible database\n");
+
+      db_perthread_deinit();
+      return -1;
+    }
+  else if (ret > 0)
     {
       DPRINTF(E_FATAL, L_DB, "Could not check database version, trying DB init\n");
 
@@ -3973,6 +4479,12 @@ db_init(void)
   DPRINTF(E_INFO, L_DB, "Database OK with %d active files and %d active playlists\n", files, pls);
 
   return 0;
+}
+
+void
+db_deinit(void)
+{
+  sqlite3_shutdown();
 }
 
 void ensure_all_utf8(struct media_file_info *mfi)

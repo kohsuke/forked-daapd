@@ -191,7 +191,12 @@ fixup_tags(struct media_file_info *mfi)
 
   /* If we don't have an album_artist, set it to artist */
   if (!mfi->album_artist)
-    mfi->album_artist = strdup(mfi->artist);
+    {
+      if (mfi->compilation)
+	mfi->album_artist = strdup("");
+      else
+	mfi->album_artist = strdup(mfi->artist);
+    }
 }
 
 
@@ -283,6 +288,8 @@ process_media_file(char *file, time_t mtime, off_t size, int compilation)
     mfi.media_kind = 1; /* music */
 
   fixup_tags(&mfi);
+
+  unicode_fixup_mfi(&mfi);
 
   if (mfi.id == 0)
     db_file_add(&mfi);
@@ -1359,6 +1366,8 @@ filescanner_deinit(void)
 
       return;
     }
+
+  event_del(&inoev);
 
 #ifdef USE_EVENTFD
   close(exit_efd);

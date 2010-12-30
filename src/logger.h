@@ -21,8 +21,11 @@
 #define L_DACP    12
 #define L_FFMPEG  13
 #define L_ART     14
+#define L_PLAYER  15
+#define L_RAOP    16
+#define L_LAUDIO  17
 
-#define N_LOGDOMAINS  15
+#define N_LOGDOMAINS  18
 
 /* Severities */
 #define E_FATAL   0
@@ -34,9 +37,6 @@
 
 
 void
-vlogger(int severity, int domain, const char *fmt, va_list args);
-
-void
 DPRINTF(int severity, int domain, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 
 void
@@ -44,6 +44,11 @@ logger_ffmpeg(void *ptr, int level, const char *fmt, va_list ap);
 
 void
 logger_libevent(int severity, const char *msg);
+
+#ifdef LAUDIO_USE_ALSA
+void
+logger_alsa(const char *file, int line, const char *function, int err, const char *fmt, ...);
+#endif
 
 void
 logger_reinit(void);

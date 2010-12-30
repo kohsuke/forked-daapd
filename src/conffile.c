@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 #include <sys/utsname.h>
 
@@ -31,6 +32,7 @@
 #include <confuse.h>
 
 #include "logger.h"
+#include "misc.h"
 #include "conffile.h"
 
 
@@ -62,15 +64,37 @@ static cfg_opt_t sec_library[] =
     CFG_END()
   };
 
+/* local audio section structure */
+static cfg_opt_t sec_audio[] =
+  {
+    CFG_STR("nickname", "Computer", CFGF_NONE),
+#ifdef __linux__
+    CFG_STR("card", "default", CFGF_NONE),
+#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
+    CFG_STR("card", "/dev/dsp", CFGF_NONE),
+#endif
+    CFG_END()
+  };
+
+/* ApEx device section structure */
+static cfg_opt_t sec_apex[] =
+  {
+    CFG_STR("password", NULL, CFGF_NONE),
+    CFG_END()
+  };
+
 /* Config file structure */
 static cfg_opt_t toplvl_cfg[] =
   {
     CFG_SEC("general", sec_general, CFGF_NONE),
     CFG_SEC("library", sec_library, CFGF_NONE),
+    CFG_SEC("audio", sec_audio, CFGF_NONE),
+    CFG_SEC("apex", sec_apex, CFGF_MULTI | CFGF_TITLE),
     CFG_END()
   };
 
 cfg_t *cfg;
+uint64_t libhash;
 
 
 static int
@@ -114,11 +138,15 @@ conffile_expand_libname(cfg_t *lib)
   int ret;
 
   libname = cfg_getstr(lib, "name");
+  olen = strlen(libname);
 
   /* Fast path */
   s = strchr(libname, '%');
   if (!s)
-    return 0;
+    {
+      libhash = murmur_hash64(libname, olen, 0);
+      return 0;
+    }
 
   /* Grab what we need */
   ret = uname(&sysinfo);
@@ -133,10 +161,8 @@ conffile_expand_libname(cfg_t *lib)
   hostlen = strlen(hostname);
   verlen = strlen(VERSION);
 
-  olen = strlen(libname);
-  len = olen;
-
   /* Compute expanded size */
+  len = olen;
   s = libname;
   while (*s)
     {
@@ -201,6 +227,8 @@ conffile_expand_libname(cfg_t *lib)
     }
 
   cfg_setstr(lib, "name", expanded);
+
+  libhash = murmur_hash64(expanded, strlen(expanded), 0);
 
   free(expanded);
 

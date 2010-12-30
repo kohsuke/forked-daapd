@@ -16,6 +16,13 @@ enum index_type {
   I_SUB
 };
 
+enum sort_type {
+  S_NONE = 0,
+  S_NAME,
+  S_ALBUM,
+  S_ARTIST,
+};
+
 #define Q_F_BROWSE (1 << 15)
 
 enum query_type {
@@ -35,6 +42,7 @@ struct query_params {
   /* Query parameters, filled in by caller */
   enum query_type type;
   enum index_type idx_type;
+  enum sort_type sort;
   int id;
   int offset;
   int limit;
@@ -262,6 +270,9 @@ void
 free_mfi(struct media_file_info *mfi, int content_only);
 
 void
+unicode_fixup_mfi(struct media_file_info *mfi);
+
+void
 free_pli(struct playlist_info *pli, int content_only);
 
 void
@@ -392,6 +403,16 @@ db_pairing_add(struct pairing_info *pi);
 int
 db_pairing_fetch_byguid(struct pairing_info *pi);
 
+/* Speakers */
+int
+db_speaker_save(uint64_t id, int selected, int volume);
+
+int
+db_speaker_get(uint64_t id, int *selected, int *volume);
+
+void
+db_speaker_clear_all(void);
+
 /* Inotify */
 int
 db_watch_clear(void);
@@ -444,5 +465,8 @@ db_perthread_deinit(void);
 
 int
 db_init(void);
+
+void
+db_deinit(void);
 
 #endif /* !__DB_H__ */

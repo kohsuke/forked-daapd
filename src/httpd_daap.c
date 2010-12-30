@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2009-2010 Julien BLACHE <jb@jblache.org>
+ * Copyright (C) 2010 Kai Elwert <elwertk@googlemail.com>
  *
  * Adapted from mt-daapd:
  * Copyright (C) 2003-2007 Ron Pedde <ron@pedde.com>
@@ -33,6 +34,9 @@
 #include <limits.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <ctype.h>
+
+#include <uninorm.h>
 
 #include <event.h>
 #include "evhttp/evhttp.h"
@@ -87,6 +91,14 @@ struct dmap_field_map {
   ssize_t mfi_offset;
   ssize_t pli_offset;
   ssize_t gri_offset;
+};
+
+struct sort_ctx {
+  struct evbuffer *headerlist;
+  int16_t mshc;
+  uint32_t mshi;
+  uint32_t mshn;
+  uint32_t misc_mshn;
 };
 
 
@@ -227,6 +239,10 @@ static const struct dmap_field dmap_msas = { "msas", "dmap.authenticationschemes
 static const struct dmap_field dmap_msau = { "msau", "dmap.authenticationmethod",              DMAP_TYPE_UBYTE };
 static const struct dmap_field dmap_msbr = { "msbr", "dmap.supportsbrowse",                    DMAP_TYPE_UBYTE };
 static const struct dmap_field dmap_msdc = { "msdc", "dmap.databasescount",                    DMAP_TYPE_UINT };
+static const struct dmap_field dmap_mshl = { "mshl", "dmap.sortingheaderlisting",              DMAP_TYPE_UINT };
+static const struct dmap_field dmap_mshc = { "mshc", "dmap.sortingheaderchar",                 DMAP_TYPE_SHORT };
+static const struct dmap_field dmap_mshi = { "mshi", "dmap.sortingheaderindex",                DMAP_TYPE_UINT };
+static const struct dmap_field dmap_mshn = { "mshn", "dmap.sortingheadernumber",               DMAP_TYPE_UINT };
 static const struct dmap_field dmap_msex = { "msex", "dmap.supportsextensions",                DMAP_TYPE_UBYTE };
 static const struct dmap_field dmap_msix = { "msix", "dmap.supportsindex",                     DMAP_TYPE_UBYTE };
 static const struct dmap_field dmap_mslr = { "mslr", "dmap.loginrequired",                     DMAP_TYPE_UBYTE };
@@ -255,7 +271,7 @@ static struct dmap_field_map dmap_fields[] =
     { 0, &dmap_mikd,
       dbmfi_offsetof(item_kind),          -1,                    -1 },
     { 0, &dmap_mper,
-      dbmfi_offsetof(id),                 -1,                    dbgri_offsetof(persistentid) },
+      dbmfi_offsetof(id),                 dbpli_offsetof(id),    dbgri_offsetof(persistentid) },
     { 0, &dmap_mcon,
       -1,                                 -1,                    -1 },
     { 0, &dmap_mcti,
@@ -527,10 +543,19 @@ daap_session_compare(const void *aa, const void *bb)
 }
 
 static void
+daap_session_free(void *item)
+{
+  struct daap_session *s;
+
+  s = (struct daap_session *)item;
+
+  evtimer_del(&s->timeout);
+  free(s);
+}
+
+static void
 daap_session_kill(struct daap_session *s)
 {
-  evtimer_del(&s->timeout);
-
   avl_delete(daap_sessions, s);
 }
 
@@ -549,10 +574,14 @@ daap_session_timeout_cb(int fd, short what, void *arg)
 static struct daap_session *
 daap_session_register(void)
 {
+#if 0
   struct timeval tv;
+#endif
   struct daap_session *s;
   avl_node_t *node;
+#if 0
   int ret;
+#endif
 
   s = (struct daap_session *)malloc(sizeof(struct daap_session));
   if (!s)
@@ -579,12 +608,14 @@ daap_session_register(void)
       return NULL;
     }
 
+#if 0
   evutil_timerclear(&tv);
   tv.tv_sec = DAAP_SESSION_TIMEOUT;
 
   ret = evtimer_add(&s->timeout, &tv);
   if (ret < 0)
     DPRINTF(E_LOG, L_DAAP, "Could not add session timeout event for session %d\n", s->id);
+#endif /* 0 */
 
   return s;
 }
@@ -593,7 +624,9 @@ struct daap_session *
 daap_session_find(struct evhttp_request *req, struct evkeyvalq *query, struct evbuffer *evbuf)
 {
   struct daap_session needle;
+#if 0
   struct timeval tv;
+#endif
   struct daap_session *s;
   avl_node_t *node;
   const char *param;
@@ -619,6 +652,7 @@ daap_session_find(struct evhttp_request *req, struct evkeyvalq *query, struct ev
 
   s = (struct daap_session *)node->item;
 
+#if 0
   event_del(&s->timeout);
 
   evutil_timerclear(&tv);
@@ -627,6 +661,7 @@ daap_session_find(struct evhttp_request *req, struct evkeyvalq *query, struct ev
   ret = evtimer_add(&s->timeout, &tv);
   if (ret < 0)
     DPRINTF(E_LOG, L_DAAP, "Could not add session timeout event for session %d\n", s->id);
+#endif /* 0 */
 
   return s;
 
@@ -647,7 +682,8 @@ update_fail_cb(struct evhttp_connection *evcon, void *arg)
 
   DPRINTF(E_DBG, L_DAAP, "Update request: client closed connection\n");
 
-  evhttp_connection_set_closecb(ur->req->evcon, NULL, NULL);
+  if (ur->req->evcon)
+    evhttp_connection_set_closecb(ur->req->evcon, NULL, NULL);
 
   if (ur == update_requests)
     update_requests = ur->next;
@@ -837,8 +873,141 @@ dmap_add_field(struct evbuffer *evbuf, const struct dmap_field *df, char *strval
 }
 
 
+/* DAAP sort headers helpers */
+static struct sort_ctx *
+daap_sort_context_new(void)
+{
+  struct sort_ctx *ctx;
+  int ret;
+
+  ctx = (struct sort_ctx *)malloc(sizeof(struct sort_ctx));
+  if (!ctx)
+    {
+      DPRINTF(E_LOG, L_DAAP, "Out of memory for sorting context\n");
+
+      return NULL;
+    }
+
+  memset(ctx, 0, sizeof(struct sort_ctx));
+
+  ctx->headerlist = evbuffer_new();
+  if (!ctx->headerlist)
+    {
+      DPRINTF(E_LOG, L_DAAP, "Could not create evbuffer for DAAP sort headers list\n");
+
+      free(ctx);
+      return NULL;
+    }
+
+  ret = evbuffer_expand(ctx->headerlist, 512);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_DAAP, "Could not expand evbuffer for DAAP sort headers list\n");
+
+      evbuffer_free(ctx->headerlist);
+      free(ctx);
+      return NULL;
+    }
+
+  ctx->mshc = -1;
+
+  return ctx;
+}
+
 static void
-get_query_params(struct evkeyvalq *query, struct query_params *qp)
+daap_sort_context_free(struct sort_ctx *ctx)
+{
+  evbuffer_free(ctx->headerlist);
+  free(ctx);
+}
+
+static int
+daap_sort_build(struct sort_ctx *ctx, char *str)
+{
+  uint8_t *ret;
+  size_t len;
+  char fl;
+
+  len = strlen(str);
+  ret = u8_normalize(UNINORM_NFD, (uint8_t *)str, len, NULL, &len);
+  if (!ret)
+    {
+      DPRINTF(E_LOG, L_DAAP, "Could not normalize string for sort header\n");
+
+      return -1;
+    }
+
+  fl = ret[0];
+  free(ret);
+
+  if (isascii(fl) && isalpha(fl))
+    {
+      fl = toupper(fl);
+
+      /* Init */
+      if (ctx->mshc == -1)
+	ctx->mshc = fl;
+
+      if (fl == ctx->mshc)
+	ctx->mshn++;
+      else
+        {
+	  dmap_add_container(ctx->headerlist, "mlit", 34);
+	  dmap_add_short(ctx->headerlist, "mshc", ctx->mshc); /* 10 */
+	  dmap_add_int(ctx->headerlist, "mshi", ctx->mshi);   /* 12 */
+	  dmap_add_int(ctx->headerlist, "mshn", ctx->mshn);   /* 12 */
+
+	  DPRINTF(E_DBG, L_DAAP, "Added sort header: mshc = %c, mshi = %u, mshn = %u fl %c\n", ctx->mshc, ctx->mshi, ctx->mshn, fl);
+
+	  ctx->mshi = ctx->mshi + ctx->mshn;
+	  ctx->mshn = 1;
+	  ctx->mshc = fl;
+	}
+    }
+  else
+    {
+      /* Non-ASCII, goes to misc category */
+      ctx->misc_mshn++;
+    }
+
+  return 0;
+}
+
+static int
+daap_sort_finalize(struct sort_ctx *ctx, struct evbuffer *evbuf)
+{
+  int ret;
+
+  /* Add current entry, if any */
+  if (ctx->mshc != -1)
+    {
+      dmap_add_container(ctx->headerlist, "mlit", 34);
+      dmap_add_short(ctx->headerlist, "mshc", ctx->mshc); /* 10 */
+      dmap_add_int(ctx->headerlist, "mshi", ctx->mshi);   /* 12 */
+      dmap_add_int(ctx->headerlist, "mshn", ctx->mshn);   /* 12 */
+
+      ctx->mshi = ctx->mshi + ctx->mshn;
+
+      DPRINTF(E_DBG, L_DAAP, "Added sort header: mshc = %c, mshi = %u, mshn = %u (final)\n", ctx->mshc, ctx->mshi, ctx->mshn);
+    }
+
+  /* Add misc category */
+  dmap_add_container(ctx->headerlist, "mlit", 34);
+  dmap_add_short(ctx->headerlist, "mshc", '0');          /* 10 */
+  dmap_add_int(ctx->headerlist, "mshi", ctx->mshi);      /* 12 */
+  dmap_add_int(ctx->headerlist, "mshn", ctx->misc_mshn); /* 12 */
+
+  dmap_add_container(evbuf, "mshl", EVBUFFER_LENGTH(ctx->headerlist));
+  ret = evbuffer_add_buffer(evbuf, ctx->headerlist);
+  if (ret < 0)
+    return -1;
+
+  return 0;
+}
+
+
+static void
+get_query_params(struct evkeyvalq *query, int *sort_headers, struct query_params *qp)
 {
   const char *param;
   char *ptr;
@@ -890,6 +1059,39 @@ get_query_params(struct evkeyvalq *query, struct query_params *qp)
     qp->limit = (high - low) + 1;
 
   qp->idx_type = I_SUB;
+
+  qp->sort = S_NONE;
+  param = evhttp_find_header(query, "sort");
+  if (param)
+    {
+      if (strcmp(param, "name") == 0)
+	qp->sort = S_NAME;
+      else if (strcmp(param, "album") == 0)
+	qp->sort = S_ALBUM;
+      else if (strcmp(param, "artist") == 0)
+	qp->sort = S_ARTIST;
+      else
+	DPRINTF(E_DBG, L_DAAP, "Unknown sort param: %s\n", param);
+
+      if (qp->sort != S_NONE)
+	DPRINTF(E_DBG, L_DAAP, "Sorting songlist by %s\n", param);
+    }
+
+  if (sort_headers)
+    {
+      *sort_headers = 0;
+      param = evhttp_find_header(query, "include-sort-headers");
+      if (param)
+	{
+	  if (strcmp(param, "1") == 0)
+	    {
+	      *sort_headers = 1;
+	      DPRINTF(E_DBG, L_DAAP, "Sort headers requested\n");
+	    }
+	  else
+	    DPRINTF(E_DBG, L_DAAP, "Unknown include-sort-headers param: %s\n", param);
+	}
+    }
 
   param = evhttp_find_header(query, "query");
   if (!param)
@@ -971,23 +1173,16 @@ daap_reply_server_info(struct evhttp_request *req, struct evbuffer *evbuf, char 
   char *name;
   char *passwd;
   const char *clientver;
-  int supports_update;
   int mpro;
   int apro;
   int len;
   int ret;
 
-  /* We don't support updates atm */
-  supports_update = 0;
-
   lib = cfg_getsec(cfg, "library");
   passwd = cfg_getstr(lib, "password");
   name = cfg_getstr(lib, "name");
 
-  len = 169 + strlen(name);
-
-  if (!supports_update)
-    len -= 9;
+  len = 136 + strlen(name);
 
   ret = evbuffer_expand(evbuf, len);
   if (ret < 0)
@@ -1020,11 +1215,12 @@ daap_reply_server_info(struct evhttp_request *req, struct evbuffer *evbuf, char 
   dmap_add_int(evbuf, "mstt", 200);  /* 12 */
   dmap_add_int(evbuf, "mpro", mpro); /* 12 */
   dmap_add_int(evbuf, "apro", apro); /* 12 */
-  dmap_add_int(evbuf, "mstm", 1800); /* 12 */
   dmap_add_string(evbuf, "minm", name); /* 8 + strlen(name) */
 
+#if 0
   dmap_add_int(evbuf, "mstm", DAAP_SESSION_TIMEOUT); /* 12 */
   dmap_add_char(evbuf, "msal", 1);   /* 9 */
+#endif
 
   dmap_add_char(evbuf, "mslr", 1);   /* 9 */
   dmap_add_char(evbuf, "msau", (passwd) ? 2 : 0); /* 9 */
@@ -1036,10 +1232,10 @@ daap_reply_server_info(struct evhttp_request *req, struct evbuffer *evbuf, char 
   dmap_add_char(evbuf, "mspi", 1);   /* 9 */
   dmap_add_int(evbuf, "msdc", 1);    /* 12 */
 
-  if (supports_update)
-    dmap_add_char(evbuf, "msup", 0); /* 9 */
+  /* Advertise updates support even though we don't send updates */
+  dmap_add_char(evbuf, "msup", 1);   /* 9 */
 
-  evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
+  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
 }
 
 static void
@@ -1078,7 +1274,7 @@ daap_reply_content_codes(struct evhttp_request *req, struct evbuffer *evbuf, cha
       dmap_add_short(evbuf, "mcty", df->type);  /* 10 */
     }
 
-  evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
+  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
 }
 
 static void
@@ -1147,7 +1343,7 @@ daap_reply_login(struct evhttp_request *req, struct evbuffer *evbuf, char **uri,
   dmap_add_int(evbuf, "mstt", 200);        /* 12 */
   dmap_add_int(evbuf, "mlid", s->id); /* 12 */
 
-  evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
+  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
 }
 
 static void
@@ -1161,7 +1357,7 @@ daap_reply_logout(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
 
   daap_session_kill(s);
 
-  evhttp_send_reply(req, 204, "Logout Successful", evbuf);
+  httpd_send_reply(req, 204, "Logout Successful", evbuf);
 }
 
 static void
@@ -1212,7 +1408,7 @@ daap_reply_update(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
       dmap_add_int(evbuf, "mstt", 200);         /* 12 */
       dmap_add_int(evbuf, "musr", current_rev); /* 12 */
 
-      evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
+      httpd_send_reply(req, HTTP_OK, "OK", evbuf);
 
       return;
     }
@@ -1290,7 +1486,7 @@ daap_reply_dblist(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
   count = db_pl_get_count();
   dmap_add_int(evbuf, "mctc", count); /* 12 */
 
-  evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
+  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
 }
 
 static void
@@ -1301,17 +1497,18 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
   struct evbuffer *song;
   struct evbuffer *songlist;
   struct dmap_field_map *dfm;
+  struct sort_ctx *sctx;
   const char *param;
   char *tag;
   char **strval;
   char *ptr;
   uint32_t *meta;
   int nmeta;
+  int sort_headers;
   int nsongs;
   int transcode;
   int want_mikd;
   int want_asdk;
-  int oom;
   int32_t val;
   int i;
   int ret;
@@ -1396,7 +1593,20 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
     }
 
   memset(&qp, 0, sizeof(struct query_params));
-  get_query_params(query, &qp);
+  get_query_params(query, &sort_headers, &qp);
+
+  sctx = NULL;
+  if (sort_headers)
+    {
+      sctx = daap_sort_context_new();
+      if (!sctx)
+	{
+	  DPRINTF(E_LOG, L_DAAP, "Could not create sort context\n");
+
+	  dmap_send_error(req, tag, "Out of memory");
+	  goto out_query_free;
+	}
+    }
 
   if (playlist != -1)
     {
@@ -1412,12 +1622,15 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
       DPRINTF(E_LOG, L_DAAP, "Could not start query\n");
 
       dmap_send_error(req, tag, "Could not start query");
+
+      if (sort_headers)
+	daap_sort_context_free(sctx);
+
       goto out_query_free;
     }
 
   want_mikd = 0;
   want_asdk = 0;
-  oom = 0;
   nsongs = 0;
   while (((ret = db_query_fetch_file(&qp, &dbmfi)) == 0) && (dbmfi.id))
     {
@@ -1524,6 +1737,18 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
 	  DPRINTF(E_DBG, L_DAAP, "Done with meta tag %s (%s)\n", dfm->field->desc, *strval);
 	}
 
+      if (sort_headers)
+	{
+	  ret = daap_sort_build(sctx, dbmfi.title);
+	  if (ret < 0)
+	    {
+	      DPRINTF(E_LOG, L_DAAP, "Could not add sort header to DAAP song list reply\n");
+
+	      ret = -100;
+	      break;
+	    }
+   	}
+
       DPRINTF(E_DBG, L_DAAP, "Done with song\n");
 
       val = 0;
@@ -1554,7 +1779,9 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
       ret = evbuffer_add_buffer(songlist, song);
       if (ret < 0)
 	{
-	  oom = 1;
+	  DPRINTF(E_LOG, L_DAAP, "Could not add song to song list for DAAP song list reply\n");
+
+	  ret = -100;
 	  break;
 	}
     }
@@ -1571,24 +1798,27 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
 
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_DAAP, "Error fetching results\n");
+      if (ret == -100)
+	  dmap_send_error(req, tag, "Out of memory");
+      else
+	{
+	  DPRINTF(E_LOG, L_DAAP, "Error fetching results\n");
+	  dmap_send_error(req, tag, "Error fetching query results");
+	}
 
-      dmap_send_error(req, tag, "Error fetching query results");
       db_query_end(&qp);
-      goto out_list_free;
-    }
 
-  if (oom)
-    {
-      DPRINTF(E_LOG, L_DAAP, "Could not add song to song list for DAAP song list reply\n");
+      if (sort_headers)
+	daap_sort_context_free(sctx);
 
-      dmap_send_error(req, tag, "Out of memory");
-      db_query_end(&qp);
       goto out_list_free;
     }
 
   /* Add header to evbuf, add songlist to evbuf */
-  dmap_add_container(evbuf, tag, EVBUFFER_LENGTH(songlist) + 53);
+  if (sort_headers)
+    dmap_add_container(evbuf, tag, EVBUFFER_LENGTH(songlist) + EVBUFFER_LENGTH(sctx->headerlist) + 53);
+  else
+    dmap_add_container(evbuf, tag, EVBUFFER_LENGTH(songlist) + 53);
   dmap_add_int(evbuf, "mstt", 200);    /* 12 */
   dmap_add_char(evbuf, "muty", 0);     /* 9 */
   dmap_add_int(evbuf, "mtco", qp.results); /* 12 */
@@ -1604,10 +1834,28 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
       DPRINTF(E_LOG, L_DAAP, "Could not add song list to DAAP song list reply\n");
 
       dmap_send_error(req, tag, "Out of memory");
+
+      if (sort_headers)
+	daap_sort_context_free(sctx);
+
       return;
     }
 
-  evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
+  if (sort_headers)
+    {
+      ret = daap_sort_finalize(sctx, evbuf);
+      daap_sort_context_free(sctx);
+
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_DAAP, "Could not add sort headers to DAAP song list reply\n");
+
+	  dmap_send_error(req, tag, "Out of memory");
+	  return;
+	}
+    }
+
+  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
 
   return;
 
@@ -1673,7 +1921,6 @@ daap_reply_playlists(struct evhttp_request *req, struct evbuffer *evbuf, char **
   uint32_t *meta;
   int nmeta;
   int npls;
-  int oom;
   int32_t val;
   int i;
   int ret;
@@ -1746,7 +1993,7 @@ daap_reply_playlists(struct evhttp_request *req, struct evbuffer *evbuf, char **
     }
 
   memset(&qp, 0, sizeof(struct query_params));
-  get_query_params(query, &qp);
+  get_query_params(query, NULL, &qp);
   qp.type = Q_PL;
 
   ret = db_query_start(&qp);
@@ -1759,7 +2006,6 @@ daap_reply_playlists(struct evhttp_request *req, struct evbuffer *evbuf, char **
     }
 
   npls = 0;
-  oom = 0;
   while (((ret = db_query_fetch_pl(&qp, &dbpli)) == 0) && (dbpli.id))
     {
       npls++;
@@ -1820,6 +2066,9 @@ daap_reply_playlists(struct evhttp_request *req, struct evbuffer *evbuf, char **
       if ((ret == 0) && (val > 0))
 	dmap_add_int(playlist, "mimc", val);
 
+      /* Container ID (mpco) */
+      dmap_add_int(playlist, "mpco", 0);
+
       /* Base playlist (abpl), id = 1 */
       val = 0;
       ret = safe_atoi32(dbpli.id, &val);
@@ -1832,7 +2081,9 @@ daap_reply_playlists(struct evhttp_request *req, struct evbuffer *evbuf, char **
       ret = evbuffer_add_buffer(playlistlist, playlist);
       if (ret < 0)
 	{
-	  oom = 1;
+	  DPRINTF(E_LOG, L_DAAP, "Could not add playlist to playlist list for DAAP playlists reply\n");
+
+	  ret = -100;
 	  break;
 	}
     }
@@ -1847,18 +2098,14 @@ daap_reply_playlists(struct evhttp_request *req, struct evbuffer *evbuf, char **
 
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_DAAP, "Error fetching results\n");
+      if (ret == -100)
+	dmap_send_error(req, "aply", "Out of memory");
+      else
+	{
+	  DPRINTF(E_LOG, L_DAAP, "Error fetching results\n");
+	  dmap_send_error(req, "aply", "Error fetching query results");
+	}
 
-      dmap_send_error(req, "aply", "Error fetching query results");
-      db_query_end(&qp);
-      goto out_list_free;
-    }
-
-  if (oom)
-    {
-      DPRINTF(E_LOG, L_DAAP, "Could not add playlist to playlist list for DAAP playlists reply\n");
-
-      dmap_send_error(req, "aply", "Out of memory");
       db_query_end(&qp);
       goto out_list_free;
     }
@@ -1883,7 +2130,7 @@ daap_reply_playlists(struct evhttp_request *req, struct evbuffer *evbuf, char **
       return;
     }
 
-  evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
+  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
 
   return;
 
@@ -1908,12 +2155,13 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
   struct evbuffer *group;
   struct evbuffer *grouplist;
   struct dmap_field_map *dfm;
+  struct sort_ctx *sctx;
   const char *param;
   char **strval;
   uint32_t *meta;
   int nmeta;
+  int sort_headers;
   int ngrp;
-  int oom;
   int32_t val;
   int i;
   int ret;
@@ -1990,8 +2238,21 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     }
 
   memset(&qp, 0, sizeof(struct query_params));
-  get_query_params(query, &qp);
+  get_query_params(query, &sort_headers, &qp);
   qp.type = Q_GROUPS;
+
+  sctx = NULL;
+  if (sort_headers)
+    {
+      sctx = daap_sort_context_new();
+      if (!sctx)
+	{
+	  DPRINTF(E_LOG, L_DAAP, "Could not create sort context\n");
+
+	  dmap_send_error(req, tag, "Out of memory");
+	  goto out_query_free;
+	}
+    }
 
   ret = db_query_start(&qp);
   if (ret < 0)
@@ -1999,11 +2260,14 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
       DPRINTF(E_LOG, L_DAAP, "Could not start query\n");
 
       dmap_send_error(req, tag, "Could not start query");
+
+      if (sort_headers)
+	daap_sort_context_free(sctx);
+
       goto out_query_free;
     }
 
   ngrp = 0;
-  oom = 0;
   while ((ret = db_query_fetch_group(&qp, &dbgri)) == 0)
     {
       ngrp++;
@@ -2035,6 +2299,18 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
 	  DPRINTF(E_DBG, L_DAAP, "Done with meta tag %s (%s)\n", dfm->field->desc, *strval);
 	}
 
+      if (sort_headers)
+	{
+	  ret = daap_sort_build(sctx, dbgri.itemname);
+	  if (ret < 0)
+	    {
+	      DPRINTF(E_LOG, L_DAAP, "Could not add sort header to DAAP groups reply\n");
+
+	      ret = -100;
+	      break;
+	    }
+	}
+
       /* Item count, always added (mimc) */
       val = 0;
       ret = safe_atoi32(dbgri.itemcount, &val);
@@ -2056,7 +2332,9 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
       ret = evbuffer_add_buffer(grouplist, group);
       if (ret < 0)
 	{
-	  oom = 1;
+	  DPRINTF(E_LOG, L_DAAP, "Could not add group to group list for DAAP groups reply\n");
+
+	  ret = -100;
 	  break;
 	}
     }
@@ -2071,24 +2349,28 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
 
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_DAAP, "Error fetching results\n");
+      if (ret == -100)
+	dmap_send_error(req, tag, "Out of memory");
+      else
+	{
+	  DPRINTF(E_LOG, L_DAAP, "Error fetching results\n");
+	  dmap_send_error(req, tag, "Error fetching query results");
+	}
 
-      dmap_send_error(req, tag, "Error fetching query results");
       db_query_end(&qp);
-      goto out_list_free;
-    }
 
-  if (oom)
-    {
-      DPRINTF(E_LOG, L_DAAP, "Could not add group to group list for DAAP groups reply\n");
+      if (sort_headers)
+	daap_sort_context_free(sctx);
 
-      dmap_send_error(req, tag, "Out of memory");
-      db_query_end(&qp);
       goto out_list_free;
     }
 
   /* Add header to evbuf, add grouplist to evbuf */
-  dmap_add_container(evbuf, tag, EVBUFFER_LENGTH(grouplist) + 53);
+  if (sort_headers)
+    dmap_add_container(evbuf, tag, EVBUFFER_LENGTH(grouplist) + EVBUFFER_LENGTH(sctx->headerlist) + 53);
+  else
+    dmap_add_container(evbuf, tag, EVBUFFER_LENGTH(grouplist) + 53);
+
   dmap_add_int(evbuf, "mstt", 200); /* 12 */
   dmap_add_char(evbuf, "muty", 0);  /* 9 */
   dmap_add_int(evbuf, "mtco", qp.results); /* 12 */
@@ -2104,10 +2386,28 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
       DPRINTF(E_LOG, L_DAAP, "Could not add group list to DAAP groups reply\n");
 
       dmap_send_error(req, tag, "Out of memory");
+
+      if (sort_headers)
+	daap_sort_context_free(sctx);
+
       return;
     }
 
-  evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
+  if (sort_headers)
+    {
+      ret = daap_sort_finalize(sctx, evbuf);
+      daap_sort_context_free(sctx);
+
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_DAAP, "Could not add sort headers to DAAP browse reply\n");
+
+	  dmap_send_error(req, tag, "Out of memory");
+	  return;
+	}
+    }
+
+  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
 
   return;
 
@@ -2129,8 +2429,10 @@ daap_reply_browse(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
   struct query_params qp;
   struct daap_session *s;
   struct evbuffer *itemlist;
+  struct sort_ctx *sctx;
   char *browse_item;
   char *tag;
+  int sort_headers;
   int nitems;
   int ret;
 
@@ -2198,7 +2500,24 @@ daap_reply_browse(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
       return;
     }
 
-  get_query_params(query, &qp);
+  get_query_params(query, &sort_headers, &qp);
+
+  sctx = NULL;
+  if (sort_headers)
+    {
+      sctx = daap_sort_context_new();
+      if (!sctx)
+	{
+	  DPRINTF(E_LOG, L_DAAP, "Could not create sort context\n");
+
+	  dmap_send_error(req, "abro", "Out of memory");
+
+	  evbuffer_free(itemlist);
+	  if (qp.filter)
+	    free(qp.filter);
+	  return;
+	}
+    }
 
   ret = db_query_start(&qp);
   if (ret < 0)
@@ -2206,6 +2525,9 @@ daap_reply_browse(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
       DPRINTF(E_LOG, L_DAAP, "Could not start query\n");
 
       dmap_send_error(req, "abro", "Could not start query");
+
+      if (sort_headers)
+	daap_sort_context_free(sctx);
 
       evbuffer_free(itemlist);
       if (qp.filter)
@@ -2218,6 +2540,17 @@ daap_reply_browse(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     {
       nitems++;
 
+      if (sort_headers)
+	{
+	  ret = daap_sort_build(sctx, browse_item);
+	  if (ret < 0)
+	    {
+	      DPRINTF(E_LOG, L_DAAP, "Could not add sort header to DAAP browse reply\n");
+
+	      break;
+	    }
+	}
+
       dmap_add_string(itemlist, "mlit", browse_item);
     }
 
@@ -2226,18 +2559,27 @@ daap_reply_browse(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
 
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_DAAP, "Error fetching results\n");
+      DPRINTF(E_LOG, L_DAAP, "Error fetching/building results\n");
 
-      dmap_send_error(req, "abro", "Error fetching query results");
+      dmap_send_error(req, "abro", "Error fetching/building query results");
       db_query_end(&qp);
+
+      if (sort_headers)
+	daap_sort_context_free(sctx);
+
       evbuffer_free(itemlist);
       return;
     }
 
-  dmap_add_container(evbuf, "abro", EVBUFFER_LENGTH(itemlist) + 44);
+  if (sort_headers)
+    dmap_add_container(evbuf, "abro", EVBUFFER_LENGTH(itemlist) + EVBUFFER_LENGTH(sctx->headerlist) + 44);
+  else
+    dmap_add_container(evbuf, "abro", EVBUFFER_LENGTH(itemlist) + 44);
+
   dmap_add_int(evbuf, "mstt", 200);    /* 12 */
   dmap_add_int(evbuf, "mtco", qp.results); /* 12 */
   dmap_add_int(evbuf, "mrco", nitems); /* 12 */
+
   dmap_add_container(evbuf, tag, EVBUFFER_LENGTH(itemlist));
 
   db_query_end(&qp);
@@ -2249,10 +2591,28 @@ daap_reply_browse(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
       DPRINTF(E_LOG, L_DAAP, "Could not add item list to DAAP browse reply\n");
 
       dmap_send_error(req, tag, "Out of memory");
+
+      if (sort_headers)
+	daap_sort_context_free(sctx);
+
       return;
     }
 
-  evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
+  if (sort_headers)
+    {
+      ret = daap_sort_finalize(sctx, evbuf);
+      daap_sort_context_free(sctx);
+
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_DAAP, "Could not add sort headers to DAAP browse reply\n");
+
+	  dmap_send_error(req, tag, "Out of memory");
+	  return;
+	}
+    }
+
+  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
 }
 
 /* NOTE: We only handle artwork at the moment */
@@ -2329,9 +2689,10 @@ daap_reply_extra_data(struct evhttp_request *req, struct evbuffer *evbuf, char *
 
   evhttp_remove_header(req->output_headers, "Content-Type");
   evhttp_add_header(req->output_headers, "Content-Type", "image/png");
-  snprintf(clen, sizeof(clen), "%ld", EVBUFFER_LENGTH(evbuf));
+  snprintf(clen, sizeof(clen), "%ld", (long)EVBUFFER_LENGTH(evbuf));
   evhttp_add_header(req->output_headers, "Content-Length", clen);
 
+  /* No gzip compression for artwork */
   evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
   return;
 
@@ -2616,6 +2977,7 @@ daap_request(struct evhttp_request *req)
   uri = strdup(full_uri);
   if (!uri)
     {
+      free(full_uri);
       evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
       return;
     }
@@ -2797,7 +3159,7 @@ daap_init(void)
         }
     }
 
-  daap_sessions = avl_alloc_tree(daap_session_compare, free);
+  daap_sessions = avl_alloc_tree(daap_session_compare, daap_session_free);
   if (!daap_sessions)
     {
       DPRINTF(E_FATAL, L_DAAP, "DAAP init could not allocate DAAP sessions AVL tree\n");
@@ -2869,6 +3231,12 @@ daap_deinit(void)
   for (ur = update_requests; update_requests; ur = update_requests)
     {
       update_requests = ur->next;
+
+      if (ur->req->evcon)
+	{
+	  evhttp_connection_set_closecb(ur->req->evcon, NULL, NULL);
+	  evhttp_connection_free(ur->req->evcon);
+	}
 
       free(ur);
     }

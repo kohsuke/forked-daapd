@@ -202,6 +202,8 @@ get_query_params(struct evhttp_request *req, struct evkeyvalq *query, struct que
   else
     qp->idx_type = I_NONE;
 
+  qp->sort = S_NONE;
+
   param = evhttp_find_header(query, "query");
   if (param)
     {
@@ -263,9 +265,31 @@ rsp_send_error(struct evhttp_request *req, char *errmsg)
 }
 
 static void
-rsp_reply_info(struct evhttp_request *req, char **uri, struct evkeyvalq *query)
+rsp_send_reply(struct evhttp_request *req, mxml_node_t *reply)
 {
   struct evbuffer *evbuf;
+
+  evbuf = mxml_to_evbuf(reply);
+  mxmlDelete(reply);
+
+  if (!evbuf)
+    {
+      rsp_send_error(req, "Could not finalize reply");
+
+      return;
+    }
+
+  evhttp_add_header(req->output_headers, "Content-Type", "text/xml; charset=utf-8");
+  evhttp_add_header(req->output_headers, "Connection", "close");
+  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+
+  evbuffer_free(evbuf);
+}
+
+
+static void
+rsp_reply_info(struct evhttp_request *req, char **uri, struct evkeyvalq *query)
+{
   mxml_node_t *reply;
   mxml_node_t *status;
   mxml_node_t *info;
@@ -314,21 +338,7 @@ rsp_reply_info(struct evhttp_request *req, char **uri, struct evkeyvalq *query)
   node = mxmlNewElement(info, "name");
   mxmlNewText(node, 0, library);
 
-  evbuf = mxml_to_evbuf(reply);
-  mxmlDelete(reply);
-
-  if (!evbuf)
-    {
-      rsp_send_error(req, "Could not finalize reply");
-
-      return;
-    }
-
-  evhttp_add_header(req->output_headers, "Content-Type", "text/xml; charset=utf-8");
-  evhttp_add_header(req->output_headers, "Connection", "close");
-  evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
-
-  evbuffer_free(evbuf);
+  rsp_send_reply(req, reply);
 }
 
 static void
@@ -336,7 +346,6 @@ rsp_reply_db(struct evhttp_request *req, char **uri, struct evkeyvalq *query)
 {
   struct query_params qp;
   struct db_playlist_info dbpli;
-  struct evbuffer *evbuf;
   char **strval;
   mxml_node_t *reply;
   mxml_node_t *status;
@@ -420,21 +429,7 @@ rsp_reply_db(struct evhttp_request *req, char **uri, struct evkeyvalq *query)
 
   db_query_end(&qp);
 
-  evbuf = mxml_to_evbuf(reply);
-  mxmlDelete(reply);
-
-  if (!evbuf)
-    {
-      rsp_send_error(req, "Could not finalize reply");
-
-      return;
-    }
-
-  evhttp_add_header(req->output_headers, "Content-Type", "text/xml; charset=utf-8");
-  evhttp_add_header(req->output_headers, "Connection", "close");
-  evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
-
-  evbuffer_free(evbuf);
+  rsp_send_reply(req, reply);
 }
 
 static void
@@ -442,7 +437,6 @@ rsp_reply_playlist(struct evhttp_request *req, char **uri, struct evkeyvalq *que
 {
   struct query_params qp;
   struct db_media_file_info dbmfi;
-  struct evbuffer *evbuf;
   const char *param;
   char **strval;
   mxml_node_t *reply;
@@ -615,28 +609,13 @@ rsp_reply_playlist(struct evhttp_request *req, char **uri, struct evkeyvalq *que
 
   db_query_end(&qp);
 
-  evbuf = mxml_to_evbuf(reply);
-  mxmlDelete(reply);
-
-  if (!evbuf)
-    {
-      rsp_send_error(req, "Could not finalize reply");
-
-      return;
-    }
-
-  evhttp_add_header(req->output_headers, "Content-Type", "text/xml; charset=utf-8");
-  evhttp_add_header(req->output_headers, "Connection", "close");
-  evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
-
-  evbuffer_free(evbuf);
+  rsp_send_reply(req, reply);
 }
 
 static void
 rsp_reply_browse(struct evhttp_request *req, char **uri, struct evkeyvalq *query)
 {
   struct query_params qp;
-  struct evbuffer *evbuf;
   char *browse_item;
   mxml_node_t *reply;
   mxml_node_t *status;
@@ -740,26 +719,12 @@ rsp_reply_browse(struct evhttp_request *req, char **uri, struct evkeyvalq *query
    * to return - this prevents mxml from sending out an empty <items/>
    * tag that the SoundBridge does not handle. It's hackish, but it works.
    */
-  if (qp.results == 0);
+  if (qp.results == 0)
     mxmlNewText(items, 0, "");
 
   db_query_end(&qp);
 
-  evbuf = mxml_to_evbuf(reply);
-  mxmlDelete(reply);
-
-  if (!evbuf)
-    {
-      rsp_send_error(req, "Could not finalize reply");
-
-      return;
-    }
-
-  evhttp_add_header(req->output_headers, "Content-Type", "text/xml; charset=utf-8");
-  evhttp_add_header(req->output_headers, "Connection", "close");
-  evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
-
-  evbuffer_free(evbuf);
+  rsp_send_reply(req, reply);
 }
 
 static void
@@ -837,6 +802,8 @@ rsp_request(struct evhttp_request *req)
   if (!uri)
     {
       rsp_send_error(req, "Server error");
+
+      free(full_uri);
       return;
     }
 

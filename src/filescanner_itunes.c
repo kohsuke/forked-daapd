@@ -64,6 +64,8 @@ static struct metadata_map md_map[] =
   {
     { "Name",         PLIST_STRING,  mfi_offsetof(title) },
     { "Artist",       PLIST_STRING,  mfi_offsetof(artist) },
+    { "Album Artist", PLIST_STRING,  mfi_offsetof(album_artist) },
+    { "Composer",     PLIST_STRING,  mfi_offsetof(composer) },
     { "Album",        PLIST_STRING,  mfi_offsetof(album) },
     { "Genre",        PLIST_STRING,  mfi_offsetof(genre) },
     { "Comments",     PLIST_STRING,  mfi_offsetof(comment) },
@@ -75,6 +77,7 @@ static struct metadata_map md_map[] =
     { "Total Time",   PLIST_UINT,    mfi_offsetof(song_length) },
     { "Bit Rate",     PLIST_UINT,    mfi_offsetof(bitrate) },
     { "Sample Rate",  PLIST_UINT,    mfi_offsetof(samplerate) },
+    { "BPM",          PLIST_UINT,    mfi_offsetof(bpm) },
     { "Rating",       PLIST_UINT,    mfi_offsetof(rating) },
     { "Compilation",  PLIST_BOOLEAN, mfi_offsetof(compilation) },
     { "Date Added",   PLIST_DATE,    mfi_offsetof(time_added) },
@@ -424,6 +427,16 @@ process_track_file(plist_t trk, char *base)
 	}
     }
 
+  /* Don't let album_artist set to "Unknown artist" if we've
+   * filled artist from the iTunes data in the meantime
+   */
+  if (strcmp(mfi->album_artist, "Unknown artist") == 0)
+    {
+      free(mfi->album_artist);
+      mfi->album_artist = strdup(mfi->artist);
+    }
+
+  unicode_fixup_mfi(mfi);
   db_file_update(mfi);
 
   free_mfi(mfi, 0);

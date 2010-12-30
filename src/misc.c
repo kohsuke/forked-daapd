@@ -33,6 +33,9 @@
 #include <limits.h>
 #include <sys/param.h>
 
+#include <unistr.h>
+#include <uniconv.h>
+
 #include "logger.h"
 #include "misc.h"
 
@@ -81,6 +84,42 @@ safe_atou32(const char *str, uint32_t *val)
 
   errno = 0;
   intval = strtoul(str, &end, 10);
+
+  if (((errno == ERANGE) && (intval == ULONG_MAX))
+      || ((errno != 0) && (intval == 0)))
+    {
+      DPRINTF(E_DBG, L_MISC, "Invalid integer in string (%s): %s\n", str, strerror(errno));
+
+      return -1;
+    }
+
+  if (end == str)
+    {
+      DPRINTF(E_DBG, L_MISC, "No integer found in string (%s)\n", str);
+
+      return -1;
+    }
+
+  if (intval > UINT32_MAX)
+    {
+      DPRINTF(E_DBG, L_MISC, "Integer value too large (%s)\n", str);
+
+      return -1;
+    }
+
+  *val = (uint32_t)intval;
+
+  return 0;
+}
+
+int
+safe_hextou32(const char *str, uint32_t *val)
+{
+  char *end;
+  unsigned long intval;
+
+  errno = 0;
+  intval = strtoul(str, &end, 16);
 
   if (((errno == ERANGE) && (intval == ULONG_MAX))
       || ((errno != 0) && (intval == 0)))
@@ -181,6 +220,175 @@ safe_atou64(const char *str, uint64_t *val)
   return 0;
 }
 
+int
+safe_hextou64(const char *str, uint64_t *val)
+{
+  char *end;
+  unsigned long long intval;
+
+  errno = 0;
+  intval = strtoull(str, &end, 16);
+
+  if (((errno == ERANGE) && (intval == ULLONG_MAX))
+      || ((errno != 0) && (intval == 0)))
+    {
+      DPRINTF(E_DBG, L_MISC, "Invalid integer in string (%s): %s\n", str, strerror(errno));
+
+      return -1;
+    }
+
+  if (end == str)
+    {
+      DPRINTF(E_DBG, L_MISC, "No integer found in string (%s)\n", str);
+
+      return -1;
+    }
+
+  if (intval > UINT64_MAX)
+    {
+      DPRINTF(E_DBG, L_MISC, "Integer value too large (%s)\n", str);
+
+      return -1;
+    }
+
+  *val = (uint64_t)intval;
+
+  return 0;
+}
+
+
+/* Key/value functions */
+int
+keyval_add_size(struct keyval *kv, const char *name, const char *value, size_t size)
+{
+  struct onekeyval *okv;
+  const char *val;
+
+  /* Check for duplicate key names */
+  val = keyval_get(kv, name);
+  if (val)
+    {
+      /* Same value, fine */
+      if (strcmp(val, value) == 0)
+        return 0;
+      else /* Different value, bad */
+        return -1;
+    }
+
+  okv = (struct onekeyval *)malloc(sizeof(struct onekeyval));
+  if (!okv)
+    {
+      DPRINTF(E_LOG, L_MISC, "Out of memory for new keyval\n");
+
+      return -1;
+    }
+
+  okv->name = strdup(name);
+  if (!okv->name)
+    {
+      DPRINTF(E_LOG, L_MISC, "Out of memory for new keyval name\n");
+
+      free(okv);
+      return -1;
+    }
+
+  okv->value = (char *)malloc(size + 1);
+  if (!okv->value)
+    {
+      DPRINTF(E_LOG, L_MISC, "Out of memory for new keyval value\n");
+
+      free(okv->name);
+      free(okv);
+      return -1;
+    }
+
+  memcpy(okv->value, value, size);
+  okv->value[size] = '\0';
+
+  okv->next = NULL;
+
+  if (!kv->head)
+    kv->head = okv;
+
+  if (kv->tail)
+    kv->tail->next = okv;
+
+  kv->tail = okv;
+
+  return 0;
+}
+
+int
+keyval_add(struct keyval *kv, const char *name, const char *value)
+{
+  return keyval_add_size(kv, name, value, strlen(value));
+}
+
+void
+keyval_remove(struct keyval *kv, const char *name)
+{
+  struct onekeyval *okv;
+  struct onekeyval *pokv;
+
+  for (pokv = NULL, okv = kv->head; okv; pokv = okv, okv = okv->next)
+    {
+      if (strcasecmp(okv->name, name) == 0)
+        break;
+    }
+
+  if (!okv)
+    return;
+
+  if (okv == kv->head)
+    kv->head = okv->next;
+
+  if (okv == kv->tail)
+    kv->tail = pokv;
+
+  if (pokv)
+    pokv->next = okv->next;
+
+  free(okv->name);
+  free(okv->value);
+  free(okv);
+}
+
+const char *
+keyval_get(struct keyval *kv, const char *name)
+{
+  struct onekeyval *okv;
+
+  for (okv = kv->head; okv; okv = okv->next)
+    {
+      if (strcasecmp(okv->name, name) == 0)
+        return okv->value;
+    }
+
+  return NULL;
+}
+
+void
+keyval_clear(struct keyval *kv)
+{
+  struct onekeyval *hokv;
+  struct onekeyval *okv;
+
+  hokv = kv->head;
+
+  for (okv = hokv; hokv; okv = hokv)
+    {
+      hokv = okv->next;
+
+      free(okv->name);
+      free(okv->value);
+      free(okv);
+    }
+
+  kv->head = NULL;
+  kv->tail = NULL;
+}
+
+
 char *
 m_realpath(const char *pathname)
 {
@@ -200,6 +408,32 @@ m_realpath(const char *pathname)
     }
 
   return ret;
+}
+
+char *
+unicode_fixup_string(char *str)
+{
+  uint8_t *ret;
+  size_t len;
+
+  if (!str)
+    return NULL;
+
+  len = strlen(str);
+
+  /* String is valid UTF-8 */
+  if (!u8_check((uint8_t *)str, len))
+    return str;
+
+  ret = u8_conv_from_encoding("ascii", iconveh_question_mark, str, len, NULL, NULL, &len);
+  if (!ret)
+    {
+      DPRINTF(E_LOG, L_MISC, "Could not convert string '%s' to UTF-8: %s\n", str, strerror(errno));
+
+      return NULL;
+    }
+
+  return (char *)ret;
 }
 
 uint32_t
@@ -308,6 +542,73 @@ b64_decode(const char *b64)
   return str;
 }
 
+static const char b64_encode_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static void
+b64_encode_block(uint8_t *in, char *out, int len)
+{
+  out[0] = b64_encode_table[in[0] >> 2];
+
+  out[2] = out[3] = '=';
+
+  if (len == 1)
+    out[1] = b64_encode_table[((in[0] & 0x03) << 4)];
+  else
+    {
+      out[1] = b64_encode_table[((in[0] & 0x03) << 4) | ((in[1] & 0xf0) >> 4)];
+
+      if (len == 2)
+	out[2] = b64_encode_table[((in[1] & 0x0f) << 2)];
+      else
+	{
+	  out[2] = b64_encode_table[((in[1] & 0x0f) << 2) | ((in[2] & 0xc0) >> 6)];
+	  out[3] = b64_encode_table[in[2] & 0x3f];
+	}
+    }
+}
+
+static void
+b64_encode_full_block(uint8_t *in, char *out)
+{
+  out[0] = b64_encode_table[in[0] >> 2];
+  out[1] = b64_encode_table[((in[0] & 0x03) << 4) | ((in[1] & 0xf0) >> 4)];
+  out[2] = b64_encode_table[((in[1] & 0x0f) << 2) | ((in[2] & 0xc0) >> 6)];
+  out[3] = b64_encode_table[in[2] & 0x3f];
+}
+
+char *
+b64_encode(uint8_t *in, size_t len)
+{
+  char *encoded;
+  char *out;
+
+  /* 3 in chars -> 4 out chars */
+  encoded = (char *)malloc(len + (len / 3) + 4 + 1);
+  if (!encoded)
+    return NULL;
+
+  out = encoded;
+
+  while (len >= 3)
+    {
+      b64_encode_full_block(in, out);
+
+      len -= 3;
+      in += 3;
+      out += 4;
+    }
+
+  if (len > 0)
+    {
+      b64_encode_block(in, out, len);
+      out += 4;
+    }
+
+  out[0] = '\0';
+
+  return encoded;
+}
+
 /*
  * MurmurHash2, 64-bit versions, by Austin Appleby
  *
@@ -383,6 +684,7 @@ murmur_hash64(const void *key, int len, uint32_t seed)
   const uint32_t m = 0x5bd1e995;
 
   const uint32_t *data;
+  const unsigned char *data_tail;
   uint32_t k1;
   uint32_t h1;
   uint32_t k2;
@@ -400,12 +702,12 @@ murmur_hash64(const void *key, int len, uint32_t seed)
       k1 = *data++;
       k1 *= m; k1 ^= k1 >> r; k1 *= m;
       h1 *= m; h1 ^= k1;
-      len -= 4;
 
       k2 = *data++;
       k2 *= m; k2 ^= k2 >> r; k2 *= m;
       h2 *= m; h2 ^= k2;
-      len -= 4;
+
+      len -= 8;
     }
 
   if (len >= 4)
@@ -416,14 +718,16 @@ murmur_hash64(const void *key, int len, uint32_t seed)
       len -= 4;
     }
 
+  data_tail = (const unsigned char *)data;
+
   switch(len)
     {
       case 3:
-	h2 ^= (uint32_t)(data[2]) << 16;
+	h2 ^= (uint32_t)(data_tail[2]) << 16;
       case 2:
-	h2 ^= (uint32_t)(data[1]) << 8;
+	h2 ^= (uint32_t)(data_tail[1]) << 8;
       case 1:
-	h2 ^= (uint32_t)(data[0]);
+	h2 ^= (uint32_t)(data_tail[0]);
 	h2 *= m;
     };
 

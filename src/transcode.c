@@ -76,6 +76,7 @@ struct transcode_ctx {
   uint64_t samples;
 
   /* WAV header */
+  int wavhdr;
   uint8_t header[44];
 };
 
@@ -149,7 +150,7 @@ transcode(struct transcode_ctx *ctx, struct evbuffer *evbuf, int wanted)
 
   processed = 0;
 
-  if (ctx->offset == 0)
+  if (ctx->wavhdr && (ctx->offset == 0))
     {
       evbuffer_add(evbuf, ctx->header, sizeof(ctx->header));
       processed += sizeof(ctx->header);
@@ -244,8 +245,86 @@ transcode(struct transcode_ctx *ctx, struct evbuffer *evbuf, int wanted)
   return processed;
 }
 
+int
+transcode_seek(struct transcode_ctx *ctx, int ms)
+{
+  int64_t start_time;
+  int64_t target_pts;
+  int64_t got_pts;
+  int got_ms;
+  int flags;
+  int ret;
+
+  start_time = ctx->fmtctx->streams[ctx->astream]->start_time;
+
+  target_pts = ms;
+  target_pts = target_pts * AV_TIME_BASE / 1000;
+  target_pts = av_rescale_q(target_pts, AV_TIME_BASE_Q, ctx->fmtctx->streams[ctx->astream]->time_base);
+
+  if ((start_time != AV_NOPTS_VALUE) && (start_time > 0))
+    target_pts += start_time;
+
+  ret = av_seek_frame(ctx->fmtctx, ctx->astream, target_pts, AVSEEK_FLAG_BACKWARD);
+  if (ret < 0)
+    {
+      DPRINTF(E_WARN, L_XCODE, "Could not seek into stream: %s\n", strerror(AVUNERROR(ret)));
+
+      return -1;
+    }
+
+  avcodec_flush_buffers(ctx->acodec);
+
+  ctx->acodec->hurry_up = 1;
+  flags = 0;
+  while (1)
+    {
+      if (ctx->apacket.data)
+	av_free_packet(&ctx->apacket);
+
+      ret = av_read_frame(ctx->fmtctx, &ctx->apacket);
+      if (ret < 0)
+	{
+	  DPRINTF(E_WARN, L_XCODE, "Could not read more data while seeking\n");
+
+	  flags = 1;
+	  break;
+	}
+
+      if (ctx->apacket.stream_index != ctx->astream)
+	continue;
+
+      /* Need a pts to return the real position */
+      if (ctx->apacket.pts == AV_NOPTS_VALUE)
+	continue;
+
+      break;
+    }
+
+  /* Error while reading frame above */
+  if (flags)
+    return -1;
+
+  /* Copy apacket data & size and do not mess with them */
+  ctx->apacket_data = ctx->apacket.data;
+  ctx->apacket_size = ctx->apacket.size;
+
+  /* Compute position in ms from pts */
+  got_pts = ctx->apacket.pts;
+
+  if ((start_time != AV_NOPTS_VALUE) && (start_time > 0))
+    got_pts -= start_time;
+
+  got_pts = av_rescale_q(got_pts, ctx->fmtctx->streams[ctx->astream]->time_base, AV_TIME_BASE_Q);
+  got_ms = got_pts / (AV_TIME_BASE / 1000);
+
+  DPRINTF(E_DBG, L_XCODE, "Seek wanted %d ms, got %d ms\n", ms, got_ms);
+
+  return got_ms;
+}
+
+
 struct transcode_ctx *
-transcode_setup(struct media_file_info *mfi, off_t *est_size)
+transcode_setup(struct media_file_info *mfi, off_t *est_size, int wavhdr)
 {
   struct transcode_ctx *ctx;
   int i;
@@ -357,8 +436,10 @@ transcode_setup(struct media_file_info *mfi, off_t *est_size)
 
   ctx->duration = mfi->song_length;
   ctx->samples = mfi->sample_count;
+  ctx->wavhdr = wavhdr;
 
-  make_wav_header(ctx, est_size);
+  if (wavhdr)
+    make_wav_header(ctx, est_size);
 
   return ctx;
 

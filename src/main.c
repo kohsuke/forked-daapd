@@ -61,8 +61,9 @@ GCRY_THREAD_OPTION_PTHREAD_IMPL;
 #include "misc.h"
 #include "filescanner.h"
 #include "httpd.h"
-#include "mdns_avahi.h"
+#include "mdns.h"
 #include "remote_pairing.h"
+#include "player.h"
 #include "ffmpeg_url_evbuffer.h"
 
 
@@ -236,7 +237,6 @@ register_services(char *ffid, int no_rsp, int no_daap)
   char records[9][128];
   int port;
   uint32_t hash;
-  uint64_t libhash;
   int i;
   int ret;
 
@@ -300,8 +300,6 @@ register_services(char *ffid, int no_rsp, int no_daap)
     {
       memset(records[i], 0, 128);
     }
-
-  libhash = murmur_hash64(libname, strlen(libname), 0);
 
   snprintf(txtrecord[0], 128, "txtvers=1");
   snprintf(txtrecord[1], 128, "DbId=%016" PRIX64, libhash);
@@ -416,6 +414,36 @@ signal_kqueue_cb(int fd, short event, void *arg)
     event_add(&sig_event, NULL);
 }
 #endif
+
+
+static int
+ffmpeg_lockmgr(void **mutex, enum AVLockOp op)
+{
+  switch (op)
+    {
+      case AV_LOCK_CREATE:
+	*mutex = malloc(sizeof(pthread_mutex_t));
+	if (!*mutex)
+	  return 1;
+
+	return !!pthread_mutex_init(*mutex, NULL);
+
+      case AV_LOCK_OBTAIN:
+	return !!pthread_mutex_lock(*mutex);
+
+      case AV_LOCK_RELEASE:
+	return !!pthread_mutex_unlock(*mutex);
+
+      case AV_LOCK_DESTROY:
+	pthread_mutex_destroy(*mutex);
+	free(*mutex);
+
+	return 0;
+    }
+
+  return 1;
+}
+
 
 int
 main(int argc, char **argv)
@@ -556,6 +584,17 @@ main(int argc, char **argv)
   DPRINTF(E_LOG, L_MAIN, "Forked Media Server Version %s taking off\n", VERSION);
 
   /* Initialize ffmpeg */
+  avcodec_init();
+
+  ret = av_lockmgr_register(ffmpeg_lockmgr);
+  if (ret < 0)
+    {
+      DPRINTF(E_FATAL, L_MAIN, "Could not register ffmpeg lock manager callback\n");
+
+      ret = EXIT_FAILURE;
+      goto ffmpeg_init_fail;
+    }
+
   av_register_all();
   av_log_set_callback(logger_ffmpeg);
   register_ffmpeg_evbuffer_url_protocol();
@@ -568,6 +607,7 @@ main(int argc, char **argv)
     {
       DPRINTF(E_FATAL, L_MAIN, "libgcrypt version mismatch\n");
 
+      ret = EXIT_FAILURE;
       goto gcrypt_init_fail;
     }
 
@@ -648,6 +688,16 @@ main(int argc, char **argv)
 
       ret = EXIT_FAILURE;
       goto filescanner_fail;
+    }
+
+  /* Spawn player thread */
+  ret = player_init();
+  if (ret != 0)
+    {
+      DPRINTF(E_FATAL, L_MAIN, "Player thread failed to start\n");
+
+      ret = EXIT_FAILURE;
+      goto player_fail;
     }
 
   /* Spawn HTTPd thread */
@@ -744,11 +794,17 @@ main(int argc, char **argv)
   httpd_deinit();
 
  httpd_fail:
+  DPRINTF(E_LOG, L_MAIN, "Player deinit\n");
+  player_deinit();
+
+ player_fail:
   DPRINTF(E_LOG, L_MAIN, "File scanner deinit\n");
   filescanner_deinit();
 
  filescanner_fail:
+  DPRINTF(E_LOG, L_MAIN, "Database deinit\n");
   db_perthread_deinit();
+  db_deinit();
  db_fail:
   if (ret == EXIT_FAILURE)
     {
@@ -771,8 +827,11 @@ main(int argc, char **argv)
 	}
     }
 
- gcrypt_init_fail:
  signal_block_fail:
+ gcrypt_init_fail:
+  av_lockmgr_register(NULL);
+
+ ffmpeg_init_fail:
   DPRINTF(E_LOG, L_MAIN, "Exiting.\n");
   conffile_unload();
   logger_deinit();
