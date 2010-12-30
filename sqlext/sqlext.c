@@ -24,7 +24,7 @@
 #include <string.h>
 #include <stdint.h>
 
-#include <unistr.h>
+// #include <unistr.h>
 #include <unictype.h>
 #include <unicase.h>
 

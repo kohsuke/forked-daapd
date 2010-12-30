@@ -33,7 +33,7 @@
 #include <limits.h>
 #include <sys/param.h>
 
-#include <unistr.h>
+//#include <unistr.h>
 #include <uniconv.h>
 
 #include "logger.h"
